@@ -3,7 +3,8 @@ import jwt from "jsonwebtoken";
 export function verifyConnection(token) {
   const secret = process.env.AUTH_SECRET;
   if (!secret) {
-    return { ok: true, clientId: "anonymous" };
+    // Security fix: fail closed when auth secret is missing to prevent bypass
+    return { ok: false, error: "Server misconfiguration: AUTH_SECRET is missing" };
   }
 
   try {
