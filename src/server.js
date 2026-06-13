@@ -48,6 +48,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        return;
+      }
+
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
