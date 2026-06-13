@@ -7,16 +7,6 @@ import jwt from "jsonwebtoken";
  */
 
 /**
- * Resolves a client identifier from a verified JWT payload.
- *
- * @param {object} payload - Decoded JWT payload.
- * @returns {string}
- */
-export function extractClientId(payload) {
-  return payload.sub ?? payload.clientId ?? "anonymous";
-}
-
-/**
  * Verifies a WebSocket connection token and resolves the client identity.
  *
  * When `AUTH_SECRET` is not set, all connections are accepted as anonymous.
@@ -42,7 +32,7 @@ export function verifyConnection(token) {
 
   try {
     const payload = jwt.verify(token, secret);
-    return { ok: true, clientId: extractClientId(payload) };
+    return { ok: true, clientId: payload.sub ?? payload.clientId ?? "anonymous" };
   } catch (err) {
     if (err instanceof jwt.TokenExpiredError) {
       return { ok: false, error: "Token has expired" };
@@ -50,6 +40,7 @@ export function verifyConnection(token) {
     if (err instanceof jwt.NotBeforeError) {
       return { ok: false, error: "Token not yet valid" };
     }
+    // JsonWebTokenError and any other jwt error
     return { ok: false, error: "Invalid token" };
   }
 }
