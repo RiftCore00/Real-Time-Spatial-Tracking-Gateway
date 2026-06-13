@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+/**
+ * @typedef {{ ok: true, data: import('zod').infer<typeof messageSchema> }} ValidOk
+ * @typedef {{ ok: false, error: string }} ValidErr
+ * @typedef {ValidOk | ValidErr} ValidationResult
+ */
+
 const locationPayloadSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
@@ -60,7 +66,7 @@ export function validateMessage(raw) {
 
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
-    return { ok: false, error: result.error.issues.map(i => i.message).join("; ") };
+    return { ok: false, error: result.error.issues.map(formatIssue).join("; ") };
   }
 
   return { ok: true, data: result.data };
