@@ -38,44 +38,30 @@ const messageSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
-/**
- * Formats a Zod issue into a human-readable string including the field path.
- *
- * @param {import('zod').ZodIssue} issue
- * @returns {string}
- */
-function formatIssue(issue) {
-  const path = issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
-  return `${path}${issue.message}`;
-}
+const MESSAGE_SIZE_LIMITS = {
+  location_update: 512,
+  join_room: 256,
+  leave_room: 256,
+};
 
-/**
- * Validates a raw WebSocket message against the known message schema.
- *
- * Accepts either a JSON string or a pre-parsed object. If a string is provided
- * it is parsed first; a parse failure returns `{ ok: false, error: "Invalid JSON" }`.
- * Schema violations return a human-readable concatenation of all Zod issue messages.
- *
- * @param {string | unknown} raw - Raw message from the WebSocket, either a JSON
- *   string or an already-parsed value.
- * @returns {ValidationResult} Result object. On success `ok` is `true` and `data`
- *   holds the validated, typed message. On failure `ok` is `false` and `error`
- *   contains a description of what went wrong.
- *
- * @example
- * const result = validateMessage('{"type":"join_room","roomId":"fleet-alpha"}');
- * if (result.ok) {
- *   console.log(result.data.roomId); // "fleet-alpha"
- * } else {
- *   console.error(result.error);
- * }
- */
 export function validateMessage(raw) {
+  const isString = typeof raw === "string";
   let parsed;
   try {
-    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    parsed = isString ? JSON.parse(raw) : raw;
   } catch {
     return { ok: false, error: "Invalid JSON" };
+  }
+
+  if (isString) {
+    const type = parsed?.type;
+    const sizeLimit = MESSAGE_SIZE_LIMITS[type];
+    if (sizeLimit !== undefined) {
+      const byteSize = Buffer.byteLength(raw, "utf8");
+      if (byteSize > sizeLimit) {
+        return { ok: false, error: `Message exceeds size limit of ${sizeLimit} bytes for type '${type}'` };
+      }
+    }
   }
 
   const result = messageSchema.safeParse(parsed);
