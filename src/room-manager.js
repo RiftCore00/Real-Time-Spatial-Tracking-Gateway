@@ -16,26 +16,45 @@ export class RoomManager {
     this._clientRooms = new Map();
   }
 
-  /**
-   * Subscribes a client to a room.
-   *
-   * If the client is already a member, the stored WebSocket reference is
-   * updated to the new one (useful after reconnection).
-   *
-   * @param {string} clientId - Unique identifier for the client.
-   * @param {string} roomId - Identifier of the room to join.
-   * @param {import("ws").WebSocket} ws - The client's active WebSocket connection.
-   */
-  join(clientId, roomId, ws) {
+  /** @private */
+  _ensureRoom(roomId) {
     if (!this._rooms.has(roomId)) {
       this._rooms.set(roomId, new Map());
     }
-    this._rooms.get(roomId).set(clientId, ws);
+    return this._rooms.get(roomId);
+  }
 
+  /** @private */
+  _ensureClientRooms(clientId) {
     if (!this._clientRooms.has(clientId)) {
       this._clientRooms.set(clientId, new Set());
     }
-    this._clientRooms.get(clientId).add(roomId);
+    return this._clientRooms.get(clientId);
+  }
+
+  /** @private */
+  _cleanupRoom(roomId) {
+    const room = this._rooms.get(roomId);
+    if (room && room.size === 0) {
+      this._rooms.delete(roomId);
+    }
+  }
+
+  /** @private */
+  _cleanupClient(clientId) {
+    const rooms = this._clientRooms.get(clientId);
+    if (rooms && rooms.size === 0) {
+      this._clientRooms.delete(clientId);
+    }
+  }
+
+  join(clientId, roomId, ws) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+    if (ws == null) throw new TypeError("ws is required");
+
+    this._ensureRoom(roomId).set(clientId, ws);
+    this._ensureClientRooms(clientId).add(roomId);
   }
 
   /**
@@ -48,20 +67,19 @@ export class RoomManager {
    * @param {string} roomId - Identifier of the room to leave.
    */
   leave(clientId, roomId) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+
     const room = this._rooms.get(roomId);
     if (room) {
       room.delete(clientId);
-      if (room.size === 0) {
-        this._rooms.delete(roomId);
-      }
+      this._cleanupRoom(roomId);
     }
 
     const clientRooms = this._clientRooms.get(clientId);
     if (clientRooms) {
       clientRooms.delete(roomId);
-      if (clientRooms.size === 0) {
-        this._clientRooms.delete(clientId);
-      }
+      this._cleanupClient(clientId);
     }
   }
 
@@ -77,6 +95,8 @@ export class RoomManager {
    * @param {string|null} [excludeClientId=null] - Client to skip (typically the publisher).
    */
   broadcast(roomId, message, excludeClientId = null) {
+    if (roomId == null) throw new TypeError("roomId is required");
+
     const room = this._rooms.get(roomId);
     if (!room) return;
 
@@ -84,8 +104,12 @@ export class RoomManager {
 
     for (const [clientId, ws] of room) {
       if (clientId === excludeClientId) continue;
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
+      if (ws != null && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(data);
+        } catch {
+          // ignore send errors for individual clients
+        }
       }
     }
   }
@@ -98,15 +122,15 @@ export class RoomManager {
    * @param {string} clientId - Unique identifier for the disconnecting client.
    */
   disconnect(clientId) {
+    if (clientId == null) throw new TypeError("clientId is required");
+
     const rooms = this._clientRooms.get(clientId);
     if (rooms) {
       for (const roomId of rooms) {
         const room = this._rooms.get(roomId);
         if (room) {
           room.delete(clientId);
-          if (room.size === 0) {
-            this._rooms.delete(roomId);
-          }
+          this._cleanupRoom(roomId);
         }
       }
       this._clientRooms.delete(clientId);
@@ -120,6 +144,7 @@ export class RoomManager {
    * @returns {number} Member count, or `0` if the room does not exist.
    */
   getRoomSize(roomId) {
+    if (roomId == null) throw new TypeError("roomId is required");
     const room = this._rooms.get(roomId);
     return room ? room.size : 0;
   }
@@ -133,6 +158,7 @@ export class RoomManager {
    * @returns {Set<string>} Room IDs, or an empty Set if the client is not tracked.
    */
   getClientRooms(clientId) {
+    if (clientId == null) throw new TypeError("clientId is required");
     const rooms = this._clientRooms.get(clientId);
     return rooms ? new Set(rooms) : new Set();
   }
