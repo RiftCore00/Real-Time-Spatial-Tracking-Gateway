@@ -5,6 +5,20 @@ import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 
+/**
+ * Safely sends a JSON frame to a client, logging any send errors.
+ * @param {import("ws").WebSocket} ws
+ * @param {object} data
+ * @param {string} clientId - Used for logging context.
+ */
+function safeSend(ws, data, clientId) {
+  try {
+    ws.send(JSON.stringify(data));
+  } catch (err) {
+    logger.error("Failed to send message", { clientId, error: err.message });
+  }
+}
+
 export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
   const wss = new WebSocketServer({
     port: port ?? 8080,
@@ -21,7 +35,15 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
     const clientId = uuid();
     ws.isAlive = true;
 
-    const url = new URL(req.url, "http://localhost");
+    let url;
+    try {
+      url = new URL(req.url, "http://localhost");
+    } catch {
+      logger.warn("Invalid request URL", { clientId, url: req.url });
+      ws.close(4000, "Invalid request URL");
+      return;
+    }
+
     const token = url.searchParams.get("token");
     const authResult = verifyConnection(token);
 
@@ -42,7 +64,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
-        ws.send(JSON.stringify({ type: "error", payload: { message: validation.error } }));
+        safeSend(ws, { type: "error", payload: { message: validation.error } }, actualClientId);
         return;
       }
 
@@ -52,22 +74,23 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
         case "join_room": {
           rooms.join(actualClientId, msg.roomId, ws);
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } }, actualClientId);
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } }, actualClientId);
           break;
         }
         case "location_update": {
           const roomIds = rooms.getClientRooms(actualClientId);
           for (const roomId of roomIds) {
-            rooms.broadcast(roomId, {
-              type: "location_update",
-              payload: { clientId: actualClientId, ...msg.payload },
-            }, actualClientId);
+            rooms.broadcast(
+              roomId,
+              { type: "location_update", payload: { clientId: actualClientId, ...msg.payload } },
+              actualClientId,
+            );
           }
           break;
         }
