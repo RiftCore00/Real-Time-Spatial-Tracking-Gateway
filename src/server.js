@@ -86,6 +86,15 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
+        }
+      }
       logger.info("Client disconnected", {
         clientId: actualClientId,
         code,
@@ -113,5 +122,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     clearInterval(interval);
   });
 
-  return { wss, rooms };
+  return { wss, rooms, ipConnectionCount };
 }
