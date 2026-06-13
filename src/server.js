@@ -4,13 +4,17 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-/**
- * Safely sends a JSON frame to a client, logging any send errors.
- * @param {import("ws").WebSocket} ws
- * @param {object} data
- * @param {string} clientId - Used for logging context.
- */
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit } = {}) {
+  const wss = new WebSocketServer({
+    port: port ?? 8080,
+    maxPayload: maxPayloadBytes ?? 1024,
+  });
+
+  const rooms = new RoomManager();
+  const connRateLimiter = createConnRateLimiter(connRateLimit);
+
 function safeSend(ws, data, clientId) {
   try {
     ws.send(JSON.stringify(data));
@@ -19,21 +23,16 @@ function safeSend(ws, data, clientId) {
   }
 }
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
-  const wss = new WebSocketServer({
-    port: port ?? 8080,
-    maxPayload: maxPayloadBytes ?? 1024,
-  });
+function handleMessage(ws, clientId, rooms, raw) {
+  const validation = validateMessage(raw.toString());
 
-  const rooms = new RoomManager();
+    const ip = req.socket.remoteAddress;
 
-  function heartbeat() {
-    this.isAlive = true;
-  }
-
-  wss.on("connection", (ws, req) => {
-    const clientId = uuid();
-    ws.isAlive = true;
+    if (!connRateLimiter.check(ip)) {
+      logger.warn("Connection rate limit exceeded", { ip });
+      ws.close(4029, "Connection rate limit exceeded");
+      return;
+    }
 
     let url;
     try {
@@ -47,71 +46,81 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
     const token = url.searchParams.get("token");
     const authResult = verifyConnection(token);
 
-    if (!authResult.ok) {
-      logger.warn("Authentication failed", { clientId, reason: authResult.error });
-      ws.close(4001, authResult.error);
-      return;
+  const msg = validation.data;
+
+  switch (msg.type) {
+    case "join_room": {
+      rooms.join(clientId, msg.roomId, ws);
+      logger.info("Client joined room", { clientId, roomId: msg.roomId });
+      safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } }, clientId);
+      break;
     }
+    case "leave_room": {
+      rooms.leave(clientId, msg.roomId);
+      logger.info("Client left room", { clientId, roomId: msg.roomId });
+      safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } }, clientId);
+      break;
+    }
+    case "location_update": {
+      const roomIds = rooms.getClientRooms(clientId);
+      for (const roomId of roomIds) {
+        rooms.broadcast(
+          roomId,
+          { type: "location_update", payload: { clientId, ...msg.payload } },
+          clientId,
+        );
+      }
+      break;
+    }
+  }
+}
 
-    const actualClientId = authResult.clientId ?? clientId;
+    logger.info("Client connected", { clientId: actualClientId, ip });
 
-    logger.info("Client connected", { clientId: actualClientId, ip: req.socket.remoteAddress });
-
-    ws.on("pong", heartbeat);
+  const token = url.searchParams.get("token");
+  const authResult = verifyConnection(token);
 
     ws.on("message", (raw) => {
-      const validation = validateMessage(raw.toString());
-
-      if (!validation.ok) {
-        logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
-        safeSend(ws, { type: "error", payload: { message: validation.error } }, actualClientId);
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
         return;
       }
 
-      const msg = validation.data;
+      const validation = validateMessage(raw.toString());
 
-      switch (msg.type) {
-        case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
-          logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
-          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } }, actualClientId);
-          break;
-        }
-        case "leave_room": {
-          rooms.leave(actualClientId, msg.roomId);
-          logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
-          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } }, actualClientId);
-          break;
-        }
-        case "location_update": {
-          const roomIds = rooms.getClientRooms(actualClientId);
-          for (const roomId of roomIds) {
-            rooms.broadcast(
-              roomId,
-              { type: "location_update", payload: { clientId: actualClientId, ...msg.payload } },
-              actualClientId,
-            );
-          }
-          break;
-        }
-      }
-    });
+  const actualClientId = authResult.clientId ?? clientId;
+  logger.info("Client connected", { clientId: actualClientId, ip: req.socket.remoteAddress });
+
+  ws.on("pong", heartbeat);
+  ws.on("message", (raw) => handleMessage(ws, actualClientId, rooms, raw));
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
+        }
+      }
       logger.info("Client disconnected", {
         clientId: actualClientId,
         code,
         reason: reason?.toString() ?? "unknown",
       });
     });
-
-    ws.on("error", (err) => {
-      logger.error("WebSocket error", { clientId: actualClientId, error: err.message });
-    });
   });
 
-  const interval = setInterval(() => {
+  ws.on("error", (err) => {
+    logger.error("WebSocket error", { clientId: actualClientId, error: err.message });
+  });
+}
+
+function setupHeartbeat(wss, intervalMs) {
+  return setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
         logger.warn("Terminating zombie connection", {});
@@ -120,11 +129,24 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
       ws.isAlive = false;
       ws.ping();
     });
-  }, heartbeatMs ?? 30000);
+  }, intervalMs);
+}
+
+export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
+  const wss = new WebSocketServer({
+    port: port ?? 8080,
+    maxPayload: maxPayloadBytes ?? 1024,
+  });
+
+  const rooms = new RoomManager();
+
+  wss.on("connection", (ws, req) => handleConnection(ws, req, rooms));
+
+  const interval = setupHeartbeat(wss, heartbeatMs ?? 30000);
 
   wss.on("close", () => {
     clearInterval(interval);
   });
 
-  return { wss, rooms };
+  return { wss, rooms, ipConnectionCount };
 }
