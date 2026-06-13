@@ -4,6 +4,7 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
   const wss = new WebSocketServer({
@@ -12,6 +13,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
   });
 
   const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter();
 
   function heartbeat() {
     this.isAlive = true;
@@ -38,6 +40,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        return;
+      }
+
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
@@ -76,6 +84,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       logger.info("Client disconnected", {
         clientId: actualClientId,
         code,
