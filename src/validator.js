@@ -77,7 +77,7 @@ export function validateMessage(raw) {
 
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
-    return { ok: false, error: buildError(result.error.issues) };
+    return { ok: false, error: result.error.issues.map(formatIssue).join("; ") };
   }
 
   return { ok: true, data: result.data };
