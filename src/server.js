@@ -4,39 +4,39 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-/**
- * Marks a WebSocket connection as alive upon receiving a pong frame.
- * Used as the `pong` event handler; `this` refers to the WebSocket instance.
- * @this {import("ws").WebSocket}
- */
-function heartbeat() {
-  this.isAlive = true;
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit } = {}) {
+  const wss = new WebSocketServer({
+    port: port ?? 8080,
+    maxPayload: maxPayloadBytes ?? 1024,
+  });
+
+  const rooms = new RoomManager();
+  const connRateLimiter = createConnRateLimiter(connRateLimit);
+
+function safeSend(ws, data, clientId) {
+  try {
+    ws.send(JSON.stringify(data));
+  } catch (err) {
+    logger.error("Failed to send message", { clientId, error: err.message });
+  }
 }
 
-/**
- * Handles an incoming raw WebSocket message for a connected client.
- *
- * Validates the message, then dispatches to join_room, leave_room, or
- * location_update logic. Sends an error frame back if validation fails.
- *
- * @param {import("ws").WebSocket} ws - The client's WebSocket connection.
- * @param {string} clientId - The resolved client identifier.
- * @param {RoomManager} rooms - The shared room manager instance.
- * @param {Buffer|string} raw - The raw message data received from the client.
- */
 function handleMessage(ws, clientId, rooms, raw) {
   const validation = validateMessage(raw.toString());
 
-  if (!validation.ok) {
-    logger.warn("Validation failed", { clientId, error: validation.error });
-    try {
-      ws.send(JSON.stringify({ type: "error", payload: { message: validation.error } }));
-    } catch (err) {
-      logger.error("Failed to send error frame", { clientId, error: err.message });
+    const ip = req.socket.remoteAddress;
+
+    if (!connRateLimiter.check(ip)) {
+      logger.warn("Connection rate limit exceeded", { ip });
+      ws.close(4029, "Connection rate limit exceeded");
+      return;
     }
-    return;
-  }
+
+    const url = new URL(req.url, "http://localhost");
+    const token = url.searchParams.get("token");
+    const authResult = verifyConnection(token);
 
   const msg = validation.data;
 
@@ -44,21 +44,13 @@ function handleMessage(ws, clientId, rooms, raw) {
     case "join_room": {
       rooms.join(clientId, msg.roomId, ws);
       logger.info("Client joined room", { clientId, roomId: msg.roomId });
-      try {
-        ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
-      } catch (err) {
-        logger.error("Failed to send room_joined", { clientId, error: err.message });
-      }
+      safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } }, clientId);
       break;
     }
     case "leave_room": {
       rooms.leave(clientId, msg.roomId);
       logger.info("Client left room", { clientId, roomId: msg.roomId });
-      try {
-        ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
-      } catch (err) {
-        logger.error("Failed to send room_left", { clientId, error: err.message });
-      }
+      safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } }, clientId);
       break;
     }
     case "location_update": {
@@ -75,49 +67,42 @@ function handleMessage(ws, clientId, rooms, raw) {
   }
 }
 
-/**
- * Handles a new WebSocket connection: authenticates the client, sets up
- * message/close/error event listeners, and registers heartbeat tracking.
- *
- * @param {import("ws").WebSocket} ws - The newly connected WebSocket.
- * @param {import("http").IncomingMessage} req - The HTTP upgrade request.
- * @param {RoomManager} rooms - The shared room manager instance.
- */
-function handleConnection(ws, req, rooms) {
-  const clientId = uuid();
-  ws.isAlive = true;
-
-  let url;
-  try {
-    url = new URL(req.url, "http://localhost");
-  } catch {
-    logger.warn("Invalid request URL", { clientId, url: req.url });
-    ws.close(4000, "Invalid request URL");
-    return;
-  }
+    logger.info("Client connected", { clientId: actualClientId, ip });
 
   const token = url.searchParams.get("token");
   const authResult = verifyConnection(token);
 
-  if (!authResult.ok) {
-    logger.warn("Authentication failed", { clientId, reason: authResult.error });
-    ws.close(4001, authResult.error);
-    return;
-  }
+    ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        return;
+      }
+
+      const validation = validateMessage(raw.toString());
 
   const actualClientId = authResult.clientId ?? clientId;
   logger.info("Client connected", { clientId: actualClientId, ip: req.socket.remoteAddress });
 
   ws.on("pong", heartbeat);
-
   ws.on("message", (raw) => handleMessage(ws, actualClientId, rooms, raw));
 
-  ws.on("close", (code, reason) => {
-    rooms.disconnect(actualClientId);
-    logger.info("Client disconnected", {
-      clientId: actualClientId,
-      code,
-      reason: reason?.toString() ?? "unknown",
+    ws.on("close", (code, reason) => {
+      rooms.disconnect(actualClientId);
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
+        }
+      }
+      logger.info("Client disconnected", {
+        clientId: actualClientId,
+        code,
+        reason: reason?.toString() ?? "unknown",
+      });
     });
   });
 
@@ -126,14 +111,6 @@ function handleConnection(ws, req, rooms) {
   });
 }
 
-/**
- * Starts the heartbeat interval that pings all connected clients and
- * terminates any that have not responded since the last cycle.
- *
- * @param {import("ws").WebSocketServer} wss - The WebSocket server instance.
- * @param {number} intervalMs - Milliseconds between heartbeat checks.
- * @returns {ReturnType<typeof setInterval>} The interval handle (pass to clearInterval to stop).
- */
 function setupHeartbeat(wss, intervalMs) {
   return setInterval(() => {
     wss.clients.forEach((ws) => {
@@ -147,16 +124,6 @@ function setupHeartbeat(wss, intervalMs) {
   }, intervalMs);
 }
 
-/**
- * Creates and starts the WebSocket tracking gateway server.
- *
- * @param {object} [options={}] - Server configuration options.
- * @param {number} [options.port=8080] - Port to listen on.
- * @param {number} [options.heartbeatMs=30000] - Heartbeat ping interval in milliseconds.
- * @param {number} [options.maxPayloadBytes=1024] - Maximum allowed incoming message size in bytes.
- * @returns {{ wss: import("ws").WebSocketServer, rooms: RoomManager }}
- *   The WebSocket server instance and the room manager.
- */
 export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
   const wss = new WebSocketServer({
     port: port ?? 8080,
@@ -173,5 +140,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
     clearInterval(interval);
   });
 
-  return { wss, rooms };
+  return { wss, rooms, ipConnectionCount };
 }
