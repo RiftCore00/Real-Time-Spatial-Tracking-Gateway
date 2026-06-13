@@ -7,6 +7,10 @@ export class RoomManager {
   }
 
   join(clientId, roomId, ws) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+    if (ws == null) throw new TypeError("ws is required");
+
     if (!this._rooms.has(roomId)) {
       this._rooms.set(roomId, new Map());
     }
@@ -19,6 +23,9 @@ export class RoomManager {
   }
 
   leave(clientId, roomId) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+
     const room = this._rooms.get(roomId);
     if (room) {
       room.delete(clientId);
@@ -37,6 +44,8 @@ export class RoomManager {
   }
 
   broadcast(roomId, message, excludeClientId = null) {
+    if (roomId == null) throw new TypeError("roomId is required");
+
     const room = this._rooms.get(roomId);
     if (!room) return;
 
@@ -44,13 +53,19 @@ export class RoomManager {
 
     for (const [clientId, ws] of room) {
       if (clientId === excludeClientId) continue;
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
+      if (ws != null && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(data);
+        } catch {
+          // ignore send errors for individual clients
+        }
       }
     }
   }
 
   disconnect(clientId) {
+    if (clientId == null) throw new TypeError("clientId is required");
+
     const rooms = this._clientRooms.get(clientId);
     if (rooms) {
       for (const roomId of rooms) {
@@ -67,11 +82,13 @@ export class RoomManager {
   }
 
   getRoomSize(roomId) {
+    if (roomId == null) throw new TypeError("roomId is required");
     const room = this._rooms.get(roomId);
     return room ? room.size : 0;
   }
 
   getClientRooms(clientId) {
+    if (clientId == null) throw new TypeError("clientId is required");
     const rooms = this._clientRooms.get(clientId);
     return rooms ? new Set(rooms) : new Set();
   }
