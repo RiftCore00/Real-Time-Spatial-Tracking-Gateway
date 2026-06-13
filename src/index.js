@@ -2,15 +2,24 @@ import "dotenv/config";
 import { createServer } from "./server.js";
 import { logger } from "./logger.js";
 
-const port = parseInt(process.env.PORT ?? "8080", 10);
-const heartbeatMs = parseInt(process.env.WS_HEARTBEAT_MS ?? "30000", 10);
-const maxPayloadBytes = parseInt(process.env.MAX_PAYLOAD_BYTES ?? "1024", 10);
+/**
+ * Parses and validates gateway configuration from environment variables.
+ * @returns {{ port: number, heartbeatMs: number, maxPayloadBytes: number }}
+ */
+export function parseConfig() {
+  return {
+    port: parseInt(process.env.PORT ?? "8080", 10),
+    heartbeatMs: parseInt(process.env.WS_HEARTBEAT_MS ?? "30000", 10),
+    maxPayloadBytes: parseInt(process.env.MAX_PAYLOAD_BYTES ?? "1024", 10),
+  };
+}
 
-const { wss } = createServer({ port, heartbeatMs, maxPayloadBytes });
-
-logger.info("Gateway started", { port, heartbeatMs, maxPayloadBytes });
-
-function shutdown(signal) {
+/**
+ * Initiates graceful shutdown of the WebSocket server.
+ * @param {import('ws').WebSocketServer} wss
+ * @param {string} signal
+ */
+export function shutdown(wss, signal) {
   logger.info("Shutting down", { signal });
   wss.close(() => {
     logger.info("Server closed");
@@ -22,5 +31,11 @@ function shutdown(signal) {
   }, 5000);
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+// Entry point
+const config = parseConfig();
+const { wss } = createServer(config);
+
+logger.info("Gateway started", config);
+
+process.on("SIGTERM", () => shutdown(wss, "SIGTERM"));
+process.on("SIGINT", () => shutdown(wss, "SIGINT"));
