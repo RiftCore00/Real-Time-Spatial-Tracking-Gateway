@@ -32,12 +32,30 @@ const messageSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+const MESSAGE_SIZE_LIMITS = {
+  location_update: 512,
+  join_room: 256,
+  leave_room: 256,
+};
+
 export function validateMessage(raw) {
+  const isString = typeof raw === "string";
   let parsed;
   try {
-    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    parsed = isString ? JSON.parse(raw) : raw;
   } catch {
     return { ok: false, error: "Invalid JSON" };
+  }
+
+  if (isString) {
+    const type = parsed?.type;
+    const sizeLimit = MESSAGE_SIZE_LIMITS[type];
+    if (sizeLimit !== undefined) {
+      const byteSize = Buffer.byteLength(raw, "utf8");
+      if (byteSize > sizeLimit) {
+        return { ok: false, error: `Message exceeds size limit of ${sizeLimit} bytes for type '${type}'` };
+      }
+    }
   }
 
   const result = messageSchema.safeParse(parsed);
