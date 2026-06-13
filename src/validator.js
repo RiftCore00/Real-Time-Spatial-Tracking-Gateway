@@ -24,15 +24,17 @@ const messageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("leave_room"), ...leaveRoomSchema.shape }),
 ]);
 
-/**
- * Attempt to parse a raw value as JSON.
- *
- * @param {string | unknown} raw
- * @returns {{ ok: true, data: unknown } | { ok: false, error: string }}
- */
-export function parseJSON(raw) {
+const MESSAGE_SIZE_LIMITS = {
+  location_update: 512,
+  join_room: 256,
+  leave_room: 256,
+};
+
+export function validateMessage(raw) {
+  const isString = typeof raw === "string";
+  let parsed;
   try {
-    return { ok: true, data: typeof raw === "string" ? JSON.parse(raw) : raw };
+    parsed = isString ? JSON.parse(raw) : raw;
   } catch {
     return { ok: false, error: "Invalid JSON" };
   }
@@ -62,7 +64,18 @@ export function validateMessage(raw) {
   const parsed = parseJSON(raw);
   if (!parsed.ok) return parsed;
 
-  const result = messageSchema.safeParse(parsed.data);
+  if (isString) {
+    const type = parsed?.type;
+    const sizeLimit = MESSAGE_SIZE_LIMITS[type];
+    if (sizeLimit !== undefined) {
+      const byteSize = Buffer.byteLength(raw, "utf8");
+      if (byteSize > sizeLimit) {
+        return { ok: false, error: `Message exceeds size limit of ${sizeLimit} bytes for type '${type}'` };
+      }
+    }
+  }
+
+  const result = messageSchema.safeParse(parsed);
   if (!result.success) {
     return { ok: false, error: buildError(result.error.issues) };
   }
