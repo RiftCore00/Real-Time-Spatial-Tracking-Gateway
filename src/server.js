@@ -34,7 +34,15 @@ function handleMessage(ws, clientId, rooms, raw) {
       return;
     }
 
-    const url = new URL(req.url, "http://localhost");
+    let url;
+    try {
+      url = new URL(req.url, "http://localhost");
+    } catch {
+      logger.warn("Invalid request URL", { clientId, url: req.url });
+      ws.close(4000, "Invalid request URL");
+      return;
+    }
+
     const token = url.searchParams.get("token");
     const authResult = verifyConnection(token);
 
