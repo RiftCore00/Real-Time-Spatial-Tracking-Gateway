@@ -31,6 +31,15 @@ try {
 
 logger.info("Gateway started", { port, heartbeatMs, maxPayloadBytes });
 
+/**
+ * Initiates a graceful shutdown of the WebSocket server.
+ *
+ * Closes the server and waits for existing connections to finish. If the
+ * server does not close within 5 seconds, a forced exit is triggered.
+ *
+ * @param {string} signal - The OS signal that triggered the shutdown (e.g. "SIGTERM").
+ * @returns {void}
+ */
 function shutdown(signal) {
   logger.info("Shutting down", { signal });
   wss.close(() => {
