@@ -37,8 +37,10 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
 
     ws.on("pong", heartbeat);
 
-    ws.on("message", (raw) => {
-      const validation = validateMessage(raw.toString());
+    ws.on("message", (raw, isBinary) => {
+      // Binary frames: decode as UTF-8 JSON, treat same as text
+      const str = isBinary ? raw.toString("utf8") : raw.toString();
+      const validation = validateMessage(str);
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
