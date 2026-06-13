@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+/**
+ * @typedef {{ ok: true, data: import('zod').infer<typeof messageSchema> }} ValidOk
+ * @typedef {{ ok: false, error: string }} ValidErr
+ * @typedef {ValidOk | ValidErr} ValidationResult
+ */
+
 const locationPayloadSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
@@ -32,6 +38,27 @@ const messageSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+/**
+ * Validates a raw WebSocket message against the known message schema.
+ *
+ * Accepts either a JSON string or a pre-parsed object. If a string is provided
+ * it is parsed first; a parse failure returns `{ ok: false, error: "Invalid JSON" }`.
+ * Schema violations return a human-readable concatenation of all Zod issue messages.
+ *
+ * @param {string | unknown} raw - Raw message from the WebSocket, either a JSON
+ *   string or an already-parsed value.
+ * @returns {ValidationResult} Result object. On success `ok` is `true` and `data`
+ *   holds the validated, typed message. On failure `ok` is `false` and `error`
+ *   contains a description of what went wrong.
+ *
+ * @example
+ * const result = validateMessage('{"type":"join_room","roomId":"fleet-alpha"}');
+ * if (result.ok) {
+ *   console.log(result.data.roomId); // "fleet-alpha"
+ * } else {
+ *   console.error(result.error);
+ * }
+ */
 export function validateMessage(raw) {
   let parsed;
   try {
