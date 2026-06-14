@@ -5,6 +5,7 @@ import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { startHealthServer } from "./health.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit } = {}) {
   const wss = new WebSocketServer({
@@ -147,6 +148,8 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
   wss.on("close", () => {
     clearInterval(interval);
   });
+
+  startHealthServer(wss);
 
   return { wss, rooms, ipConnectionCount };
 }
