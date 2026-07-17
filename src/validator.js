@@ -15,13 +15,27 @@ const locationPayloadSchema = z.object({
   timestamp: z.string().datetime().optional(),
 });
 
-const joinRoomSchema = z.object({ roomId: z.string().min(1).max(128) });
-const leaveRoomSchema = z.object({ roomId: z.string().min(1).max(128) });
+const joinRoomSchema = z.object({
+  roomId: z.string().min(1).max(128),
+});
+
+const leaveRoomSchema = z.object({
+  roomId: z.string().min(1).max(128),
+});
 
 const messageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("location_update"), payload: locationPayloadSchema }),
-  z.object({ type: z.literal("join_room"), ...joinRoomSchema.shape }),
-  z.object({ type: z.literal("leave_room"), ...leaveRoomSchema.shape }),
+  z.object({
+    type: z.literal("location_update"),
+    payload: locationPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("join_room"),
+    ...joinRoomSchema.shape,
+  }),
+  z.object({
+    type: z.literal("leave_room"),
+    ...leaveRoomSchema.shape,
+  }),
 ]);
 
 const MESSAGE_SIZE_LIMITS = {
@@ -29,26 +43,6 @@ const MESSAGE_SIZE_LIMITS = {
   join_room: 256,
   leave_room: 256,
 };
-
-export function validateMessage(raw) {
-  const isString = typeof raw === "string";
-  let parsed;
-  try {
-    parsed = isString ? JSON.parse(raw) : raw;
-  } catch {
-    return { ok: false, error: "Invalid JSON" };
-  }
-}
-
-/**
- * Build an error string from a list of Zod issues.
- *
- * @param {import('zod').ZodIssue[]} issues
- * @returns {string}
- */
-export function buildError(issues) {
-  return issues.map(i => i.message).join("; ");
-}
 
 /**
  * Validates a raw WebSocket message against the known message schema.
@@ -61,8 +55,13 @@ export function buildError(issues) {
  * if (result.ok) console.log(result.data.roomId);
  */
 export function validateMessage(raw) {
-  const parsed = parseJSON(raw);
-  if (!parsed.ok) return parsed;
+  const isString = typeof raw === "string";
+  let parsed;
+  try {
+    parsed = isString ? JSON.parse(raw) : raw;
+  } catch {
+    return { ok: false, error: "Invalid JSON" };
+  }
 
   if (isString) {
     const type = parsed?.type;
@@ -77,7 +76,7 @@ export function validateMessage(raw) {
 
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
-    return { ok: false, error: result.error.issues.map(formatIssue).join("; ") };
+    return { ok: false, error: result.error.issues.map(i => i.message).join("; ") };
   }
 
   return { ok: true, data: result.data };
