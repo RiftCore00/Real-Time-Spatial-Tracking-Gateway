@@ -4,7 +4,7 @@
  * @returns {{ check: (ip: string) => boolean }}
  */
 export function createConnRateLimiter(maxPerMinute) {
-  const limit = maxPerMinute ?? (Number(process.env.CONN_RATE_LIMIT) || 30);
+  const limit = maxPerMinute ?? (Number(process.env.MAX_CONNECTIONS_PER_IP ?? process.env.CONN_RATE_LIMIT) || 30);
   /** @type {Map<string, number[]>} */
   const windows = new Map();
 

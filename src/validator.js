@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { logger } from "./logger.js";
 
 /**
  * @typedef {{ ok: true, data: import('zod').infer<typeof messageSchema> }} ValidOk
@@ -30,16 +31,6 @@ const MESSAGE_SIZE_LIMITS = {
   leave_room: 256,
 };
 
-export function validateMessage(raw) {
-  const isString = typeof raw === "string";
-  let parsed;
-  try {
-    parsed = isString ? JSON.parse(raw) : raw;
-  } catch {
-    return { ok: false, error: "Invalid JSON" };
-  }
-}
-
 /**
  * Build an error string from a list of Zod issues.
  *
@@ -48,6 +39,17 @@ export function validateMessage(raw) {
  */
 export function buildError(issues) {
   return issues.map(i => i.message).join("; ");
+}
+
+/**
+ * Format a single Zod issue into a human-readable string.
+ *
+ * @param {import('zod').ZodIssue} issue
+ * @returns {string}
+ */
+function formatIssue(issue) {
+  const path = issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
+  return `${path}${issue.message}`;
 }
 
 /**
@@ -61,8 +63,13 @@ export function buildError(issues) {
  * if (result.ok) console.log(result.data.roomId);
  */
 export function validateMessage(raw) {
-  const parsed = parseJSON(raw);
-  if (!parsed.ok) return parsed;
+  const isString = typeof raw === "string";
+  let parsed;
+  try {
+    parsed = isString ? JSON.parse(raw) : raw;
+  } catch {
+    return { ok: false, error: "Invalid JSON" };
+  }
 
   if (isString) {
     const type = parsed?.type;
@@ -78,6 +85,18 @@ export function validateMessage(raw) {
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
     return { ok: false, error: result.error.issues.map(formatIssue).join("; ") };
+  }
+
+  const skew = Number(process.env.MAX_TIMESTAMP_SKEW_MS ?? 30000);
+  if (result.data.type === "location_update" && result.data.payload.timestamp) {
+    const diff = Math.abs(Date.now() - Date.parse(result.data.payload.timestamp));
+    if (diff >= skew) {
+      logger.warn("Timestamp freshness validation failed", {
+        clientId: parsed.clientId,
+        timestamp: result.data.payload.timestamp,
+      });
+      return { ok: false, error: "Timestamp is too old or too far in the future" };
+    }
   }
 
   return { ok: true, data: result.data };
