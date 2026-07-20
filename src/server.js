@@ -1,3 +1,4 @@
+import http from "node:http";
 import { WebSocketServer } from "ws";
 import { v4 as uuid } from "uuid";
 import { RoomManager } from "./room-manager.js";
@@ -7,10 +8,32 @@ import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+  const server = http.createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "OK" }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+  });
+
   const wss = new WebSocketServer({
-    port: port ?? 8080,
+    server,
     maxPayload: maxPayloadBytes ?? 1024,
   });
+
+  server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
@@ -138,7 +161,8 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
   wss.on("close", () => {
     clearInterval(interval);
+    server.close();
   });
 
-  return { wss, rooms, ipConnectionCount };
+  return { wss, server, rooms, ipConnectionCount };
 }
