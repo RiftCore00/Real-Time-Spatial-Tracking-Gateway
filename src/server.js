@@ -6,14 +6,7 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit } = {}) {
-  const wss = new WebSocketServer({
-    port: port ?? 8080,
-    maxPayload: maxPayloadBytes ?? 1024,
-  });
-
-  const rooms = new RoomManager();
-  const connRateLimiter = createConnRateLimiter(connRateLimit);
+const ipConnectionCount = new Map();
 
 function safeSend(ws, data, clientId) {
   try {
@@ -25,26 +18,10 @@ function safeSend(ws, data, clientId) {
 
 function handleMessage(ws, clientId, rooms, raw) {
   const validation = validateMessage(raw.toString());
-
-    const ip = req.socket.remoteAddress;
-
-    if (!connRateLimiter.check(ip)) {
-      logger.warn("Connection rate limit exceeded", { ip });
-      ws.close(4029, "Connection rate limit exceeded");
-      return;
-    }
-
-    let url;
-    try {
-      url = new URL(req.url, "http://localhost");
-    } catch {
-      logger.warn("Invalid request URL", { clientId, url: req.url });
-      ws.close(4000, "Invalid request URL");
-      return;
-    }
-
-    const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+  if (!validation.ok) {
+    safeSend(ws, { type: "error", payload: { message: validation.error } }, clientId);
+    return;
+  }
 
   const msg = validation.data;
 
@@ -75,42 +52,55 @@ function handleMessage(ws, clientId, rooms, raw) {
   }
 }
 
-    logger.info("Client connected", { clientId: actualClientId, ip });
+function handleConnection(ws, req, rooms, connRateLimiter) {
+  const clientId = uuid();
+  const ip = req.socket.remoteAddress;
+
+  if (!connRateLimiter.check(ip)) {
+    logger.warn("Connection rate limit exceeded", { ip });
+    ws.close(4029, "Connection rate limit exceeded");
+    return;
+  }
+
+  let url;
+  try {
+    url = new URL(req.url, "http://localhost");
+  } catch {
+    logger.warn("Invalid request URL", { clientId, url: req.url });
+    ws.close(4000, "Invalid request URL");
+    return;
+  }
 
   const token = url.searchParams.get("token");
   const authResult = verifyConnection(token);
 
-    ws.on("message", (raw) => {
-      if (!rateLimiter.check(actualClientId)) {
-        logger.warn("Rate limit exceeded", { clientId: actualClientId });
-        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
-        return;
-      }
-
-      const validation = validateMessage(raw.toString());
+  if (!authResult.ok) {
+    ws.close(4001, authResult.error);
+    return;
+  }
 
   const actualClientId = authResult.clientId ?? clientId;
-  logger.info("Client connected", { clientId: actualClientId, ip: req.socket.remoteAddress });
+  logger.info("Client connected", { clientId: actualClientId, ip });
 
-  ws.on("pong", heartbeat);
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
   ws.on("message", (raw) => handleMessage(ws, actualClientId, rooms, raw));
 
-    ws.on("close", (code, reason) => {
-      rooms.disconnect(actualClientId);
-      const trackedIp = ws._trackedIp;
-      if (trackedIp) {
-        const count = ipConnectionCount.get(trackedIp) ?? 1;
-        if (count <= 1) {
-          ipConnectionCount.delete(trackedIp);
-        } else {
-          ipConnectionCount.set(trackedIp, count - 1);
-        }
+  ws.on("close", (code, reason) => {
+    rooms.disconnect(actualClientId);
+    const trackedIp = ws._trackedIp;
+    if (trackedIp) {
+      const count = ipConnectionCount.get(trackedIp) ?? 1;
+      if (count <= 1) {
+        ipConnectionCount.delete(trackedIp);
+      } else {
+        ipConnectionCount.set(trackedIp, count - 1);
       }
-      logger.info("Client disconnected", {
-        clientId: actualClientId,
-        code,
-        reason: reason?.toString() ?? "unknown",
-      });
+    }
+    logger.info("Client disconnected", {
+      clientId: actualClientId,
+      code,
+      reason: reason?.toString() ?? "unknown",
     });
   });
 
@@ -123,7 +113,7 @@ function setupHeartbeat(wss, intervalMs) {
   return setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", {});
+        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
         return ws.terminate();
       }
       ws.isAlive = false;
@@ -132,15 +122,16 @@ function setupHeartbeat(wss, intervalMs) {
   }, intervalMs);
 }
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes } = {}) {
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
   const wss = new WebSocketServer({
     port: port ?? 8080,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
   const rooms = new RoomManager();
+  const connRateLimiter = createConnRateLimiter(connRateLimit ?? maxConnectionsPerIp);
 
-  wss.on("connection", (ws, req) => handleConnection(ws, req, rooms));
+  wss.on("connection", (ws, req) => handleConnection(ws, req, rooms, connRateLimiter));
 
   const interval = setupHeartbeat(wss, heartbeatMs ?? 30000);
 

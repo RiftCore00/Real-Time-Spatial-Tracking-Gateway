@@ -1,8 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
 
+const TEST_SECRET = "test-secret";
+
+function makeToken(clientId) {
+  return jwt.sign({ sub: clientId }, TEST_SECRET, { expiresIn: 60 });
+}
+
 function makeReq(ip = "1.1.1.1") {
-  return { url: "/?token=test", socket: { remoteAddress: ip } };
+  return { url: `/?token=${makeToken("test-client")}`, socket: { remoteAddress: ip } };
 }
 
 describe("binary WebSocket frame support (issue 29)", () => {
@@ -11,6 +18,7 @@ describe("binary WebSocket frame support (issue 29)", () => {
   let ws;
 
   beforeEach(() => {
+    process.env.AUTH_SECRET = TEST_SECRET;
     server = createServer({ port: 0 });
     ws = {
       isAlive: false,
@@ -23,7 +31,10 @@ describe("binary WebSocket frame support (issue 29)", () => {
     server.wss.emit("connection", ws, makeReq());
   });
 
-  afterEach(() => new Promise((res) => server.wss.close(res)));
+  afterEach(async () => {
+    delete process.env.AUTH_SECRET;
+    await new Promise((res) => server.wss.close(res));
+  });
 
   it("accepts a valid JSON join_room sent as a binary Buffer", () => {
     const msg = JSON.stringify({ type: "join_room", roomId: "test-room" });

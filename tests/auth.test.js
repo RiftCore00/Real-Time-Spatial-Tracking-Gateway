@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
 
 describe("auth", () => {
-  it("allows anonymous when no secret is configured", async () => {
+  it("rejects connection when AUTH_SECRET is not configured", async () => {
     process.env.AUTH_SECRET = "";
     const { verifyConnection } = await import("../src/auth.js");
     const result = verifyConnection(null);
-    expect(result.ok).toBe(true);
-    expect(result.clientId).toBe("anonymous");
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/AUTH_SECRET|misconfiguration/i);
   });
 
   it("rejects a missing token when secret is set", async () => {
