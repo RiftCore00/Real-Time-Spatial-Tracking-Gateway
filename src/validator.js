@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { logger } from "./logger.js";
 
 const locationPayloadSchema = z.object({
   latitude: z.number().min(-90).max(90),
@@ -61,6 +62,18 @@ export function validateMessage(raw) {
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
     return { ok: false, error: result.error.issues.map(i => i.message).join("; ") };
+  }
+
+  const skew = Number(process.env.MAX_TIMESTAMP_SKEW_MS ?? 30000);
+  if (result.data.type === "location_update" && result.data.payload.timestamp) {
+    const diff = Math.abs(Date.now() - Date.parse(result.data.payload.timestamp));
+    if (diff >= skew) {
+      logger.warn("Timestamp freshness validation failed", {
+        clientId: parsed.clientId,
+        timestamp: result.data.payload.timestamp,
+      });
+      return { ok: false, error: "Timestamp is too old or too far in the future" };
+    }
   }
 
   return { ok: true, data: result.data };

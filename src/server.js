@@ -128,7 +128,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", {});
+        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
         return ws.terminate();
       }
       ws.isAlive = false;
