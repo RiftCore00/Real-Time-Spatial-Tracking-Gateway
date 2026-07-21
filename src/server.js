@@ -6,13 +6,14 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp, maxRoomSize } = {}) {
   const wss = new WebSocketServer({
     port: port ?? 8080,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
-  const rooms = new RoomManager();
+  const MAX_ROOM_SIZE_ENV = process.env.MAX_ROOM_SIZE ? Number(process.env.MAX_ROOM_SIZE) : undefined;
+  const rooms = new RoomManager({ maxRoomSize: maxRoomSize ?? MAX_ROOM_SIZE_ENV });
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
@@ -78,7 +79,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
           break;
