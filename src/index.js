@@ -32,8 +32,10 @@ if (isNaN(config.maxPayloadBytes) || config.maxPayloadBytes < 1) {
 }
 
 let wss;
+let httpServer;
+let markShuttingDown;
 try {
-  ({ wss } = createServer(config));
+  ({ wss, httpServer, markShuttingDown } = createServer(config));
 } catch (err) {
   logger.error("Failed to start server", { error: err.message });
   process.exit(1);
@@ -42,7 +44,7 @@ try {
 logger.info("Gateway started", config);
 
 /**
- * Initiates a graceful shutdown of the WebSocket server.
+ * Initiates a graceful shutdown of the server.
  *
  * Closes the server and waits for existing connections to finish. If the
  * server does not close within 5 seconds, a forced exit is triggered.
@@ -63,8 +65,16 @@ export function shutdown(server, signal) {
   }, 5000);
 }
 
-process.on("SIGTERM", () => shutdown(wss, "SIGTERM"));
-process.on("SIGINT", () => shutdown(wss, "SIGINT"));
+process.on("SIGTERM", () => {
+  markShuttingDown();
+  wss.close();
+  shutdown(httpServer, "SIGTERM");
+});
+process.on("SIGINT", () => {
+  markShuttingDown();
+  wss.close();
+  shutdown(httpServer, "SIGINT");
+});
 
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception", { error: err.message });
