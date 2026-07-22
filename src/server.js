@@ -8,6 +8,33 @@ import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+  const server = http.createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "OK" }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+  });
+
+  const wss = new WebSocketServer({
+    server,
+    maxPayload: maxPayloadBytes ?? 1024,
+  });
+
+  server.listen(port ?? 8080);
+
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
@@ -221,30 +248,10 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     });
   }, heartbeatMs ?? 30000);
 
-  function measureLag() {
-    const start = Date.now();
-    setTimeout(() => {
-      metrics.eventLoopLagMs = Date.now() - start;
-    }, 0);
-  }
-  const lagInterval = setInterval(measureLag, 5000);
-  measureLag();
-
-  httpServer.on("close", () => {
-    clearInterval(heartbeatInterval);
-    clearInterval(lagInterval);
+  wss.on("close", () => {
+    clearInterval(interval);
+    server.close();
   });
 
-  httpServer.listen(port ?? 8080);
-
-  wss.address = () => httpServer.address();
-
-  function markShuttingDown() {
-    isShuttingDown = true;
-    isReady = false;
-  }
-
-  isReady = true;
-
-  return { wss, httpServer, rooms, metrics, ipConnectionCount, markShuttingDown };
+  return { wss, server, rooms, ipConnectionCount };
 }
