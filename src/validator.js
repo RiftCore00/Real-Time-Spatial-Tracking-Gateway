@@ -18,6 +18,11 @@ const leaveRoomSchema = z.object({
   roomId: z.string().min(1).max(128),
 });
 
+const reconnectSchema = z.object({
+  roomId: z.string().min(1).max(128),
+  lastSeq: z.number().min(0),
+});
+
 const messageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("location_update"),
@@ -31,12 +36,17 @@ const messageSchema = z.discriminatedUnion("type", [
     type: z.literal("leave_room"),
     ...leaveRoomSchema.shape,
   }),
+  z.object({
+    type: z.literal("reconnect"),
+    ...reconnectSchema.shape,
+  }),
 ]);
 
 const MESSAGE_SIZE_LIMITS = {
   location_update: 512,
   join_room: 256,
   leave_room: 256,
+  reconnect: 256,
 };
 
 export function validateMessage(raw) {

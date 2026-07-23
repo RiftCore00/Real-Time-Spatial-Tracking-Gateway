@@ -7,7 +7,17 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+export function createServer({
+  port,
+  heartbeatMs,
+  maxPayloadBytes,
+  connRateLimit,
+  maxConnectionsPerIp,
+  ringBufferSize,
+  deduplicationWindowMs,
+  maxBufferBytes,
+  maxDedupEntries,
+} = {}) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -35,7 +45,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
   server.listen(port ?? 8080);
 
-  const rooms = new RoomManager();
+  const rooms = new RoomManager({ ringBufferSize, deduplicationWindowMs, maxBufferBytes, maxDedupEntries });
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
@@ -110,6 +120,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
           ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
+          break;
+        }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(actualClientId);
+          if (!clientRooms.has(msg.roomId)) {
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Must join room before reconnecting" } }));
+            break;
+          }
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq);
+          ws.send(JSON.stringify(replayResult));
           break;
         }
         case "location_update": {
