@@ -6,6 +6,7 @@ import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { createRateLimiter } from "./rate-limiter.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
   const server = http.createServer((req, res) => {
@@ -37,6 +38,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
+  const rateLimiter = createRateLimiter();
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
@@ -89,6 +91,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Message rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        return;
+      }
+
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
@@ -127,6 +135,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
       if (trackedIp) {
         const count = ipConnectionCount.get(trackedIp) ?? 1;
@@ -164,5 +173,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     server.close();
   });
 
-  return { wss, server, rooms, ipConnectionCount };
+  return { wss, server, rooms, ipConnectionCount, rateLimiter };
 }
