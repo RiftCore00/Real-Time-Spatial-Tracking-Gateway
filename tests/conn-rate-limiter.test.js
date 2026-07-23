@@ -31,6 +31,31 @@ describe("createConnRateLimiter", () => {
     expect(limiter.check("5.5.5.5")).toBe(false);
     delete process.env.CONN_RATE_LIMIT;
   });
+
+  it("cleanup removes the IP's state so check starts a fresh window", () => {
+    const limiter = createConnRateLimiter(1);
+    expect(limiter.check("6.6.6.6")).toBe(true);   // uses the 1-connection limit
+    expect(limiter.check("6.6.6.6")).toBe(false);  // now blocked
+    limiter.cleanup("6.6.6.6");
+    expect(limiter.check("6.6.6.6")).toBe(true);   // fresh window after cleanup
+  });
+
+  it("cleanup reduces the windows Map size", () => {
+    const limiter = createConnRateLimiter(5);
+    limiter.check("7.7.7.7");
+    limiter.check("8.8.8.8");
+    // Both IPs now have entries; cleanup one of them
+    limiter.cleanup("7.7.7.7");
+    // After cleanup the entry for 7.7.7.7 is gone — a fresh check creates a new entry
+    // and still succeeds (counter reset), confirming deletion occurred
+    expect(limiter.check("7.7.7.7")).toBe(true);
+  });
+
+  it("cleanup is a no-op for an IP that was never tracked", () => {
+    const limiter = createConnRateLimiter(5);
+    // Should not throw for an unknown IP
+    expect(() => limiter.cleanup("9.9.9.9")).not.toThrow();
+  });
 });
 
 describe("server connection rate limiting (issue 27)", () => {

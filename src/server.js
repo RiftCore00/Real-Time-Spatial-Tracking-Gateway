@@ -135,6 +135,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         } else {
           ipConnectionCount.set(trackedIp, count - 1);
         }
+        connRateLimiter.cleanup(trackedIp);
       }
       logger.info("Client disconnected", {
         clientId: actualClientId,
