@@ -31,12 +31,17 @@ const messageSchema = z.discriminatedUnion("type", [
     type: z.literal("leave_room"),
     ...leaveRoomSchema.shape,
   }),
+  z.object({
+    type: z.literal("token_refresh"),
+    token: z.string().min(1),
+  }),
 ]);
 
 const MESSAGE_SIZE_LIMITS = {
   location_update: 512,
   join_room: 256,
   leave_room: 256,
+  token_refresh: 2048,
 };
 
 export function validateMessage(raw) {
