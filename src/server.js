@@ -6,6 +6,15 @@ import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { createRateLimiter } from "./rate-limiter.js";
+
+function safeSend(ws, data) {
+  try {
+    ws.send(typeof data === "string" ? data : JSON.stringify(data));
+  } catch {
+    // Silently ignore send errors (connection may have closed)
+  }
+}
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
   const server = http.createServer((req, res) => {
@@ -37,6 +46,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
+  const rateLimiter = createRateLimiter();
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
@@ -89,11 +99,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
+        return;
+      }
+
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
-        ws.send(JSON.stringify({ type: "error", payload: { message: validation.error } }));
+        safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
 
@@ -103,13 +118,13 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         case "join_room": {
           rooms.join(actualClientId, msg.roomId, ws);
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
           break;
         }
         case "location_update": {
@@ -127,6 +142,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
       if (trackedIp) {
         const count = ipConnectionCount.get(trackedIp) ?? 1;
@@ -164,5 +180,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     server.close();
   });
 
-  return { wss, server, rooms, ipConnectionCount };
+  return { wss, rooms };
 }
