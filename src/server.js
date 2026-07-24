@@ -84,6 +84,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const actualClientId = authResult.clientId ?? clientId;
+    ws._clientId = actualClientId;
     logger.info("Client connected", { clientId: actualClientId, ip });
 
     ws.on("pong", heartbeat);
@@ -151,7 +152,9 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
+        logger.warn("Terminating zombie connection", {
+          clientId: ws._clientId ?? ws._trackedIp ?? "unknown",
+        });
         return ws.terminate();
       }
       ws.isAlive = false;
