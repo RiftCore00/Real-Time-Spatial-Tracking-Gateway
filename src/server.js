@@ -44,7 +44,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     this.isAlive = true;
   }
 
-  wss.on("connection", (ws, req) => {
+  wss.on("connection", async (ws, req) => {
     const clientId = uuid();
     ws.isAlive = true;
 
@@ -75,7 +75,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+    const authResult = await verifyConnection(token);
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
@@ -83,12 +83,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
       return;
     }
 
-    const actualClientId = authResult.clientId ?? clientId;
+    let actualClientId = authResult.clientId ?? clientId;
     logger.info("Client connected", { clientId: actualClientId, ip });
 
     ws.on("pong", heartbeat);
 
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
@@ -119,6 +119,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
               type: "location_update",
               payload: { clientId: actualClientId, ...msg.payload },
             }, actualClientId);
+          }
+          break;
+        }
+        case "token_refresh": {
+          const result = await verifyConnection(msg.token);
+          if (result.ok) {
+            actualClientId = result.clientId;
+            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
           }
           break;
         }
