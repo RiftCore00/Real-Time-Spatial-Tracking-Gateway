@@ -217,6 +217,30 @@ describe("createServer", () => {
     await closeAll(ws);
   });
 
+  it("stores the resolved clientId on the socket and includes it in zombie logs", async () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const heartbeatServer = createServer({ port: 0, heartbeatMs: 20, maxPayloadBytes: 4096 });
+    const testPort = heartbeatServer.wss.address().port;
+    const ws = await connect(testPort, makeToken("zombie-client"));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const serverWs = Array.from(heartbeatServer.wss.clients)[0];
+    expect(serverWs._clientId).toBe("zombie-client");
+
+    serverWs.isAlive = false;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Terminating zombie connection",
+      expect.objectContaining({ clientId: "zombie-client" })
+    );
+
+    warnSpy.mockRestore();
+    ws.terminate();
+    await new Promise((resolve) => heartbeatServer.wss.close(resolve));
+  });
+
   it("closes with 4000 on malformed request URL", () => {
     function makeReq(url) {
       return { url, socket: { remoteAddress: "1.1.1.1" } };
