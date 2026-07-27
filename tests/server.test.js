@@ -73,6 +73,21 @@ describe("createServer", () => {
     await closeAll(ws);
   });
 
+  it("responds to GET /health with 200 OK and status OK without auth token", async () => {
+    const res = await fetch(`http://localhost:${port}/health`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const data = await res.json();
+    expect(data).toEqual({ status: "OK" });
+  });
+
+  it("responds to GET on unknown path with 404 Not Found", async () => {
+    const res = await fetch(`http://localhost:${port}/unknown`);
+    expect(res.status).toBe(404);
+    const data = await res.json();
+    expect(data).toEqual({ error: "Not Found" });
+  });
+
   it("rejects connection with close code 4001 when token is missing", async () => {
     const ws = new WebSocket(`ws://localhost:${port}/`);
     const code = await new Promise((resolve) => ws.once("close", (c) => resolve(c)));

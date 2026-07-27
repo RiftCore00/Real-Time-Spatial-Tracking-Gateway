@@ -1,3 +1,4 @@
+import http from "node:http";
 import { WebSocketServer } from "ws";
 import { v4 as uuid } from "uuid";
 import { RoomManager } from "./room-manager.js";
@@ -6,14 +7,35 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp, maxRoomSize } = {}) {
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+  const server = http.createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "OK" }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+  });
+
   const wss = new WebSocketServer({
-    port: port ?? 8080,
+    server,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
-  const MAX_ROOM_SIZE_ENV = process.env.MAX_ROOM_SIZE ? Number(process.env.MAX_ROOM_SIZE) : undefined;
-  const rooms = new RoomManager({ maxRoomSize: maxRoomSize ?? MAX_ROOM_SIZE_ENV });
+  server.listen(port ?? 8080);
+
+  const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
@@ -144,7 +166,8 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
   wss.on("close", () => {
     clearInterval(interval);
+    server.close();
   });
 
-  return { wss, rooms, ipConnectionCount };
+  return { wss, server, rooms, ipConnectionCount };
 }
