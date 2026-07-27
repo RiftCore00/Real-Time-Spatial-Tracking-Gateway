@@ -9,11 +9,44 @@ import { WebSocket } from "ws";
  * which is used during disconnection cleanup.
  */
 export class RoomManager {
-  constructor() {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRoomsPerClient=50]
+   * @param {number} [options.maxMembersPerRoom=10000]
+   * @param {number} [options.maxRooms=10000]
+   * @param {object} [options.circuitBreaker]
+   * @param {boolean} [options.circuitBreaker.enabled=false]
+   * @param {number} [options.circuitBreaker.memoryThresholdBytes]
+   * @param {number} [options.circuitBreaker.recoveryThresholdBytes]
+   */
+  constructor(options = {}) {
+    const {
+      maxRoomsPerClient = 50,
+      maxMembersPerRoom = 10000,
+      maxRooms = 10000,
+      circuitBreaker = {},
+    } = options;
+
+    this._maxRoomsPerClient = maxRoomsPerClient;
+    this._maxMembersPerRoom = maxMembersPerRoom;
+    this._maxRooms = maxRooms;
+
+    const cbMemoryThreshold = circuitBreaker.memoryThresholdBytes ?? 512 * 1024 * 1024;
+    const cbRecoveryThreshold = circuitBreaker.recoveryThresholdBytes ?? Math.floor(cbMemoryThreshold * 0.75);
+
+    this._circuitBreaker = {
+      enabled: circuitBreaker.enabled ?? (circuitBreaker.memoryThresholdBytes != null || circuitBreaker.recoveryThresholdBytes != null),
+      memoryThresholdBytes: cbMemoryThreshold,
+      recoveryThresholdBytes: cbRecoveryThreshold,
+    };
+    this._circuitBreakerState = "CLOSED";
+
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
+    /** @type {number} */
+    this._totalMembers = 0;
   }
 
   /** @private */
@@ -53,7 +86,69 @@ export class RoomManager {
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
-    this._ensureRoom(roomId).set(clientId, ws);
+    if (this._circuitBreaker.enabled) {
+      const heapUsed = process.memoryUsage().heapUsed;
+      if (this._circuitBreakerState === "CLOSED") {
+        if (heapUsed > this._circuitBreaker.memoryThresholdBytes) {
+          this._circuitBreakerState = "OPEN";
+        }
+      } else if (this._circuitBreakerState === "OPEN") {
+        if (heapUsed < this._circuitBreaker.recoveryThresholdBytes) {
+          this._circuitBreakerState = "CLOSED";
+        }
+      }
+
+      if (this._circuitBreakerState === "OPEN") {
+        return {
+          type: "error",
+          payload: {
+            code: "CIRCUIT_BREAKER_OPEN",
+            message: "Circuit breaker is open due to high resource pressure",
+          },
+        };
+      }
+    }
+
+    const roomExists = this._rooms.has(roomId);
+    if (!roomExists && this._rooms.size >= this._maxRooms) {
+      return {
+        type: "error",
+        payload: {
+          code: "MAX_ROOMS_REACHED",
+          message: `Maximum room count ceiling reached (${this._maxRooms})`,
+        },
+      };
+    }
+
+    const clientRooms = this._clientRooms.get(clientId);
+    const isClientInRoom = clientRooms ? clientRooms.has(roomId) : false;
+
+    if (!isClientInRoom && (clientRooms?.size ?? 0) >= this._maxRoomsPerClient) {
+      return {
+        type: "error",
+        payload: {
+          code: "ROOM_LIMIT_EXCEEDED",
+          message: `Client room limit exceeded (${this._maxRoomsPerClient})`,
+        },
+      };
+    }
+
+    const room = roomExists ? this._rooms.get(roomId) : null;
+    if (!isClientInRoom && (room?.size ?? 0) >= this._maxMembersPerRoom) {
+      return {
+        type: "error",
+        payload: {
+          code: "ROOM_FULL",
+          message: `Room member limit reached (${this._maxMembersPerRoom})`,
+        },
+      };
+    }
+
+    const targetRoom = this._ensureRoom(roomId);
+    if (!targetRoom.has(clientId)) {
+      this._totalMembers++;
+    }
+    targetRoom.set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
   }
 
@@ -71,8 +166,9 @@ export class RoomManager {
     if (roomId == null) throw new TypeError("roomId is required");
 
     const room = this._rooms.get(roomId);
-    if (room) {
+    if (room && room.has(clientId)) {
       room.delete(clientId);
+      this._totalMembers--;
       this._cleanupRoom(roomId);
     }
 
@@ -126,6 +222,7 @@ export class RoomManager {
 
     const rooms = this._clientRooms.get(clientId);
     if (rooms) {
+      this._totalMembers -= rooms.size;
       for (const roomId of rooms) {
         const room = this._rooms.get(roomId);
         if (room) {
@@ -177,5 +274,18 @@ export class RoomManager {
    */
   get clientCount() {
     return this._clientRooms.size;
+  }
+
+  /**
+   * RoomManager statistics and metrics.
+   * @type {{ roomCount: number, clientCount: number, totalMembers: number, circuitBreakerState: string }}
+   */
+  get stats() {
+    return {
+      roomCount: this._rooms.size,
+      clientCount: this._clientRooms.size,
+      totalMembers: this._totalMembers,
+      circuitBreakerState: this._circuitBreakerState,
+    };
   }
 }
