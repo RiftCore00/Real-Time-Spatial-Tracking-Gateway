@@ -104,7 +104,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
           break;

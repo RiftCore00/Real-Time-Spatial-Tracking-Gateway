@@ -99,6 +99,7 @@ cp .env.example .env
 | `PORT`                | `8080`               | WebSocket server listen port          |
 | `WS_HEARTBEAT_MS`     | `30000`              | Interval for connection pings         |
 | `MAX_PAYLOAD_BYTES`   | `1024`               | Maximum incoming message size         |
+| `MAX_ROOM_SIZE`       | `Infinity`           | Maximum number of clients in a room   |
 | `DATABASE_URL`        | —                    | Connection string for storage adapter |
 | `AUTH_SECRET`         | —                    | Secret for token verification         |
 

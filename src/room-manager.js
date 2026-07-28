@@ -9,11 +9,12 @@ import { WebSocket } from "ws";
  * which is used during disconnection cleanup.
  */
 export class RoomManager {
-  constructor() {
+  constructor({ maxRoomSize = Infinity } = {}) {
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
+    this._maxRoomSize = maxRoomSize;
   }
 
   /** @private */
@@ -53,8 +54,14 @@ export class RoomManager {
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
-    this._ensureRoom(roomId).set(clientId, ws);
+    const room = this._ensureRoom(roomId);
+    if (!room.has(clientId) && room.size >= this._maxRoomSize) {
+      return { ok: false, reason: 'ROOM_FULL' };
+    }
+
+    room.set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
+    return { ok: true };
   }
 
   /**
