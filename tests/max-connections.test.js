@@ -1,9 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
+
+const TEST_SECRET = "test-secret";
+
+function makeToken(clientId) {
+  return jwt.sign({ sub: clientId }, TEST_SECRET, { expiresIn: 60 });
+}
 
 function makeReq(ip = "1.2.3.4") {
   return {
-    url: "/?token=test",
+    url: `/?token=${makeToken("test-client")}`,
     socket: { remoteAddress: ip },
   };
 }
@@ -24,11 +31,15 @@ describe("max connections per IP (issue 26)", () => {
   let server;
 
   beforeEach(() => {
+    process.env.AUTH_SECRET = TEST_SECRET;
     server = createServer({ port: 0, maxConnectionsPerIp: 2 });
     wss = server.wss;
   });
 
-  afterEach(() => new Promise((res) => wss.close(res)));
+  afterEach(async () => {
+    delete process.env.AUTH_SECRET;
+    await new Promise((res) => wss.close(res));
+  });
 
   it("allows connections up to the limit", () => {
     const ws1 = makeWs();
@@ -65,6 +76,7 @@ describe("max connections per IP (issue 26)", () => {
 
   it("defaults to MAX_CONNECTIONS_PER_IP env var", () => {
     process.env.MAX_CONNECTIONS_PER_IP = "1";
+    process.env.AUTH_SECRET = TEST_SECRET;
     const s = createServer({ port: 0 });
     const ws1 = makeWs();
     const ws2 = makeWs();
@@ -72,6 +84,7 @@ describe("max connections per IP (issue 26)", () => {
     s.wss.emit("connection", ws2, makeReq("10.0.0.5"));
     expect(ws2.close).toHaveBeenCalledWith(4029, expect.any(String));
     delete process.env.MAX_CONNECTIONS_PER_IP;
+    delete process.env.AUTH_SECRET;
     s.wss.close();
   });
 });

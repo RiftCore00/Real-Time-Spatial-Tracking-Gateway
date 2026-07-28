@@ -1,5 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { WebSocketServer } from "ws";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { RoomManager } from "../src/room-manager.js";
 import { validateMessage } from "../src/validator.js";
 

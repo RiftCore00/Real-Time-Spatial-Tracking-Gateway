@@ -126,6 +126,14 @@ wss://<host>:<port>/?token=<jwt>
 
 Clients must provide a valid JWT as a query parameter. Connections without a valid token are rejected with a `4001` close code.
 
+### HTTP Health Check
+
+```
+GET /health
+```
+
+Returns `200 OK` with JSON `{"status":"OK"}` when the gateway is active. This endpoint is unauthenticated and intended for container health checks and orchestrator liveness probes.
+
 ### Message Format
 
 All messages are JSON-encoded. Every message **must** contain a `type` field:

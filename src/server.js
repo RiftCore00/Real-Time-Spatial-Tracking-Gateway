@@ -1,3 +1,4 @@
+import http from "node:http";
 import { WebSocketServer } from "ws";
 import { v4 as uuid } from "uuid";
 import { RoomManager } from "./room-manager.js";
@@ -7,40 +8,39 @@ import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
-/**
- * Creates and starts a WebSocket server for the spatial tracking gateway.
- *
- * @param {object} [options]
- * @param {number} [options.port=8080]                   - Port to listen on. Use 0 for ephemeral.
- * @param {number} [options.heartbeatMs=30000]           - Heartbeat interval in milliseconds.
- * @param {number} [options.maxPayloadBytes=1024]        - Max WebSocket frame payload in bytes.
- * @param {number} [options.maxMessagesPerSecond]        - Per-client message rate limit (msgs/sec).
- *                                                         Defaults to MAX_MESSAGES_PER_SECOND env var or 100.
- * @param {number} [options.connRateLimit]               - Max new connections per IP per minute.
- *                                                         Defaults to CONN_RATE_LIMIT env var or 30.
- * @param {number} [options.maxConnectionsPerIp]         - Max simultaneous connections per IP.
- *                                                         Defaults to MAX_CONNECTIONS_PER_IP env var or 10.
- * @returns {{ wss: WebSocketServer, rooms: RoomManager, ipConnectionCount: Map }}
- */
-export function createServer({
-  port,
-  heartbeatMs,
-  maxPayloadBytes,
-  maxMessagesPerSecond,
-  connRateLimit,
-  maxConnectionsPerIp,
-} = {}) {
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+  const server = http.createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "OK" }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+  });
+
   const wss = new WebSocketServer({
-    port: port ?? 8080,
+    server,
     maxPayload: maxPayloadBytes ?? 1024,
   });
+
+  server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
   const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
-  const MAX_CONNS_PER_IP =
-    maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
+  const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
   function heartbeat() {
     this.isAlive = true;
@@ -59,7 +59,6 @@ export function createServer({
       return;
     }
 
-    // Max simultaneous connections per IP
     const currentCount = ipConnectionCount.get(ip) ?? 0;
     if (currentCount >= MAX_CONNS_PER_IP) {
       logger.warn("Max connections per IP exceeded", { ip });
@@ -92,17 +91,8 @@ export function createServer({
 
     ws.on("pong", heartbeat);
 
-    ws.on("message", (raw, isBinary) => {
-      // Per-client message rate limit
-      if (!rateLimiter.check(actualClientId)) {
-        logger.warn("Rate limit exceeded", { clientId: actualClientId });
-        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
-        return;
-      }
-
-      // Binary frames: decode as UTF-8 JSON, treat same as text
-      const str = isBinary ? raw.toString("utf8") : raw.toString();
-      const validation = validateMessage(str);
+    ws.on("message", (raw) => {
+      const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
@@ -128,11 +118,10 @@ export function createServer({
         case "location_update": {
           const roomIds = rooms.getClientRooms(actualClientId);
           for (const roomId of roomIds) {
-            rooms.broadcast(
-              roomId,
-              { type: "location_update", payload: { clientId: actualClientId, ...msg.payload } },
-              actualClientId,
-            );
+            rooms.broadcast(roomId, {
+              type: "location_update",
+              payload: { clientId: actualClientId, ...msg.payload },
+            }, actualClientId);
           }
           break;
         }
@@ -166,7 +155,7 @@ export function createServer({
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", {});
+        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
         return ws.terminate();
       }
       ws.isAlive = false;
@@ -176,7 +165,8 @@ export function createServer({
 
   wss.on("close", () => {
     clearInterval(interval);
+    server.close();
   });
 
-  return { wss, rooms, ipConnectionCount };
+  return { wss, server, rooms, ipConnectionCount };
 }

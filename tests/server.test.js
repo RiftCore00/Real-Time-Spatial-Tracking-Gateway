@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import WebSocket from "ws";
 import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
+import { logger } from "../src/logger.js";
 
 const TEST_SECRET = "test-secret-key";
 
@@ -70,6 +71,21 @@ describe("createServer", () => {
     const ws = await connect(port, makeToken("client-a"));
     expect(ws.readyState).toBe(WebSocket.OPEN);
     await closeAll(ws);
+  });
+
+  it("responds to GET /health with 200 OK and status OK without auth token", async () => {
+    const res = await fetch(`http://localhost:${port}/health`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const data = await res.json();
+    expect(data).toEqual({ status: "OK" });
+  });
+
+  it("responds to GET on unknown path with 404 Not Found", async () => {
+    const res = await fetch(`http://localhost:${port}/unknown`);
+    expect(res.status).toBe(404);
+    const data = await res.json();
+    expect(data).toEqual({ error: "Not Found" });
   });
 
   it("rejects connection with close code 4001 when token is missing", async () => {
@@ -175,5 +191,45 @@ describe("createServer", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(server.rooms.getRoomSize("cleanup-room")).toBe(0);
+  });
+
+  it("logs error on ws error event", async () => {
+    const errorSpy = vi.spyOn(logger, "error");
+    const ws = await connect(port, makeToken("error-client"));
+
+    // Allow connection to be fully established
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Get the server-side WebSocket and emit an error on it
+    const serverWs = Array.from(server.wss.clients)[0];
+    const testError = new Error("socket hang up");
+    serverWs.emit("error", testError);
+
+    // Allow a brief moment for the error handler to process
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "WebSocket error",
+      expect.objectContaining({ error: "socket hang up" })
+    );
+
+    errorSpy.mockRestore();
+    await closeAll(ws);
+  });
+
+  it("closes with 4000 on malformed request URL", () => {
+    function makeReq(url) {
+      return { url, socket: { remoteAddress: "1.1.1.1" } };
+    }
+
+    function makeWs() {
+      return { isAlive: false, close: vi.fn(), send: vi.fn(), on: vi.fn() };
+    }
+
+    const ws = makeWs();
+    // Pass a URL that will fail URL parsing (invalid IPv6 bracket)
+    server.wss.emit("connection", ws, makeReq("http://["));
+
+    expect(ws.close).toHaveBeenCalledWith(4000, expect.any(String));
   });
 });
