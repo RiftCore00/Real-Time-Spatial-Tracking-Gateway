@@ -114,7 +114,7 @@ export function createServer({
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
-        ws.send(JSON.stringify({ type: "error", payload: { message: validation.error } }));
+        safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
 
@@ -129,13 +129,13 @@ export function createServer({
             break;
           }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
           break;
         }
         case "reconnect": {
