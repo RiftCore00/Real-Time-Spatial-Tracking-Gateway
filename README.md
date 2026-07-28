@@ -94,14 +94,22 @@ Copy the environment template and adjust values:
 cp .env.example .env
 ```
 
-| Variable              | Default              | Description                           |
-|-----------------------|----------------------|---------------------------------------|
-| `PORT`                | `8080`               | WebSocket server listen port          |
-| `WS_HEARTBEAT_MS`     | `30000`              | Interval for connection pings         |
-| `MAX_PAYLOAD_BYTES`   | `1024`               | Maximum incoming message size         |
-| `MAX_ROOM_SIZE`       | `Infinity`           | Maximum number of clients in a room   |
-| `DATABASE_URL`        | —                    | Connection string for storage adapter |
-| `AUTH_SECRET`         | —                    | Secret for token verification         |
+| Variable                   | Default   | Description                                            |
+|----------------------------|-----------|--------------------------------------------------------|
+| `PORT`                     | `8080`    | WebSocket server listen port                           |
+| `WS_HEARTBEAT_MS`          | `30000`   | Interval for connection pings (ms)                     |
+| `MAX_PAYLOAD_BYTES`        | `1024`    | Maximum incoming message size (bytes)                  |
+| `MAX_ROOM_SIZE`            | `500`     | Maximum number of clients in a room                    |
+| `DATABASE_URL`             | —         | Connection string for storage adapter                  |
+| `AUTH_SECRET`              | —         | Secret for token verification                          |
+| `MAX_TIMESTAMP_SKEW_MS`    | `30000`   | Maximum allowed clock skew on location timestamps (ms) |
+| `LOG_LEVEL`                | `info`    | Minimum log severity (`debug` \| `info` \| `warn` \| `error`) |
+| `MAX_MESSAGES_PER_SECOND`  | `100`     | Per-client message rate limit (messages per second)    |
+| `CONN_RATE_LIMIT`          | `30`      | Max new connections per IP address per minute          |
+
+#### Tuning rate limits for high-traffic deployments
+
+For high-traffic scenarios such as dense fleet tracking or large-scale live events, tune the two rate-limit variables to match your expected load. Raise `MAX_MESSAGES_PER_SECOND` (e.g. `500`) if individual clients publish location updates at sub-second intervals. Raise `CONN_RATE_LIMIT` (e.g. `120`) when a large number of devices reconnect simultaneously — common after a server restart or network partition. Lower these values in consumer-facing deployments to reduce the blast radius of misbehaving or malicious clients. Both variables take effect at startup; restart the server after changing them.
 
 ### Running
 

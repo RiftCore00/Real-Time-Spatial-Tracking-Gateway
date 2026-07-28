@@ -7,7 +7,6 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
-import { createRateLimiter } from "./rate-limiter.js";
 
 export function createServer({
   port,
@@ -15,10 +14,10 @@ export function createServer({
   maxPayloadBytes,
   connRateLimit,
   maxConnectionsPerIp,
-  ringBufferSize,
-  deduplicationWindowMs,
-  maxBufferBytes,
-  maxDedupEntries,
+  ringBufferSize: _ringBufferSize,
+  deduplicationWindowMs: _deduplicationWindowMs,
+  maxBufferBytes: _maxBufferBytes,
+  maxDedupEntries: _maxDedupEntries,
 } = {}) {
   const server = http.createServer((req, res) => {
     let url;
@@ -48,14 +47,19 @@ export function createServer({
   server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
-  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
-  const connRateLimiter = createConnRateLimiter(connRateLimit);
   const rateLimiter = createRateLimiter();
+  const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
   function heartbeat() {
     this.isAlive = true;
+  }
+
+  function safeSend(ws, data) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(data));
+    }
   }
 
   wss.on("connection", (ws, req) => {
