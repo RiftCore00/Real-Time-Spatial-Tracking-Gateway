@@ -59,4 +59,63 @@ describe("shutdown", () => {
     vi.advanceTimersByTime(5000);
     expect(exitSpy).toHaveBeenCalledWith(1);
   });
+
+  it("sends shutdown notification to all connected clients before closing", () => {
+    const sendSpy = vi.fn();
+    mockWss.clients = new Set([{ send: sendSpy, readyState: 1, bufferedAmount: 0 }]);
+    shutdown(mockWss, "SIGTERM");
+    vi.advanceTimersByTime(200);
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith(JSON.stringify({ type: "server_shutting_down", payload: { reconnectIn: 5 } }));
+  });
+
+  it("waits for bufferedAmount === 0 before closing each client", async () => {
+    let bufferedAmount = 100;
+    const client = {
+      readyState: 1,
+      get bufferedAmount() { return bufferedAmount; },
+      send: vi.fn(() => { bufferedAmount = 0; }),
+      close: vi.fn(),
+    };
+    mockWss.clients = new Set([client]);
+    shutdown(mockWss, "SIGTERM");
+    vi.advanceTimersByTime(4200);
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  it("sends close frame with code 1001", () => {
+    const client = { readyState: 1, bufferedAmount: 0, send: vi.fn(), close: vi.fn() };
+    mockWss.clients = new Set([client]);
+    shutdown(mockWss, "SIGTERM");
+    vi.advanceTimersByTime(4200);
+    expect(client.close).toHaveBeenCalledWith(1001, "Going Away");
+  });
+
+  it("total shutdown time does not exceed 5 seconds even with unresponsive clients", () => {
+    const client = {
+      readyState: 1,
+      bufferedAmount: 100,
+      send: vi.fn(),
+      close: vi.fn(),
+    };
+    mockWss.clients = new Set([client]);
+    mockWss.close = vi.fn();
+    shutdown(mockWss, "SIGTERM");
+    vi.advanceTimersByTime(5000);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("emits structured log entries at each phase transition", async () => {
+    const { logger } = await import("../src/logger.js");
+    const logSpy = vi.spyOn(logger, "info").mockImplementation(() => {});
+    const mockWssLog = { close: vi.fn((cb) => cb()), clients: new Set() };
+    shutdown(mockWssLog, "SIGTERM");
+    vi.advanceTimersByTime(4200);
+    expect(logSpy).toHaveBeenCalledWith("shutdown: stopping accept", { signal: "SIGTERM" });
+    expect(logSpy).toHaveBeenCalledWith("shutdown: notifying N clients", { clientCount: 0 });
+    expect(logSpy).toHaveBeenCalledWith("shutdown: draining N clients", { clientCount: 0 });
+    expect(logSpy).toHaveBeenCalledWith("shutdown: closing N clients", { clientCount: 0 });
+    logSpy.mockRestore();
+  });
 });

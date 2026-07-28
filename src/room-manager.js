@@ -9,37 +9,12 @@ import { WebSocket } from "ws";
  * which is used during disconnection cleanup.
  */
 export class RoomManager {
-  /**
-   * @param {object} [options]
-   * @param {number} [options.ringBufferSize=1000] - Maximum stored messages per room.
-   * @param {number} [options.deduplicationWindowMs=5000] - Deduplication TTL window in milliseconds.
-   * @param {number} [options.maxBufferBytes=5242880] - Maximum memory limit for room ring buffer in bytes.
-   * @param {number} [options.maxDedupEntries=10000] - Maximum tracked deduplication keys.
-   */
-  constructor({
-    ringBufferSize = 1000,
-    deduplicationWindowMs = 5000,
-    maxBufferBytes = 5 * 1024 * 1024,
-    maxDedupEntries = 10000,
-  } = {}) {
+  constructor({ maxRoomSize = Infinity } = {}) {
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
-
-    this._ringBufferSize = ringBufferSize;
-    this._deduplicationWindowMs = deduplicationWindowMs;
-    this._maxBufferBytes = maxBufferBytes;
-    this._maxDedupEntries = maxDedupEntries;
-
-    /** @type {Map<string, number>} */
-    this._roomSeq = new Map();
-    /** @type {Map<string, Array<{ seq: number, payload: any, timestamp: number }>>} */
-    this._roomBuffers = new Map();
-    /** @type {Map<string, number>} */
-    this._roomBufferBytes = new Map();
-    /** @type {Map<string, number>} */
-    this._dedupCache = new Map();
+    this._maxRoomSize = maxRoomSize;
   }
 
   /** @private */
@@ -113,8 +88,14 @@ export class RoomManager {
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
-    this._ensureRoom(roomId).set(clientId, ws);
+    const room = this._ensureRoom(roomId);
+    if (!room.has(clientId) && room.size >= this._maxRoomSize) {
+      return { ok: false, reason: 'ROOM_FULL' };
+    }
+
+    room.set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
+    return { ok: true };
   }
 
   /**

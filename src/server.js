@@ -5,6 +5,7 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
 export function createServer({
@@ -45,7 +46,8 @@ export function createServer({
 
   server.listen(port ?? 8080);
 
-  const rooms = new RoomManager({ ringBufferSize, deduplicationWindowMs, maxBufferBytes, maxDedupEntries });
+  const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
@@ -60,6 +62,7 @@ export function createServer({
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       ws.close(4029, "Connection rate limit exceeded");
@@ -111,7 +114,12 @@ export function createServer({
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
           break;
@@ -147,6 +155,7 @@ export function createServer({
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
       if (trackedIp) {
         const count = ipConnectionCount.get(trackedIp) ?? 1;
@@ -155,6 +164,7 @@ export function createServer({
         } else {
           ipConnectionCount.set(trackedIp, count - 1);
         }
+        connRateLimiter.cleanup(trackedIp);
       }
       logger.info("Client disconnected", {
         clientId: actualClientId,
