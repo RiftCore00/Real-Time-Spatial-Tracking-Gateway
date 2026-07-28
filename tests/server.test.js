@@ -113,6 +113,30 @@ describe("createServer", () => {
     await closeAll(ws);
   });
 
+  it("sends error frame when join is rejected due to room capacity", async () => {
+    // We override the default limit by setting the env var, then recreating the server
+    await new Promise((resolve) => server.wss.close(resolve));
+    process.env.MAX_ROOM_SIZE = "1";
+    server = createServer({ port: 0, heartbeatMs: 60000, maxPayloadBytes: 4096 });
+    port = server.wss.address().port;
+
+    const ws1 = await connect(port, makeToken("client-e"));
+    const j1 = nextMessages(ws1, 1);
+    ws1.send(JSON.stringify({ type: "join_room", roomId: "full-room" }));
+    await j1;
+
+    const ws2 = await connect(port, makeToken("client-f"));
+    const j2 = nextMessages(ws2, 1);
+    ws2.send(JSON.stringify({ type: "join_room", roomId: "full-room" }));
+    
+    const [msg] = await j2;
+    expect(msg.type).toBe("error");
+    expect(msg.payload.code).toBe("ROOM_FULL");
+    
+    delete process.env.MAX_ROOM_SIZE;
+    await closeAll(ws1, ws2);
+  });
+
   it("sends room_left confirmation on leave_room", async () => {
     const ws = await connect(port, makeToken("client-d"));
     const j = nextMessages(ws, 1);
@@ -193,6 +217,41 @@ describe("createServer", () => {
     expect(server.rooms.getRoomSize("cleanup-room")).toBe(0);
   });
 
+
+  it("cleans up message rate limiter state on disconnect", async () => {
+    await new Promise((resolve) => server.wss.close(resolve));
+    process.env.MAX_MESSAGES_PER_SECOND = "1";
+    server = createServer({ port: 0, heartbeatMs: 60000, maxPayloadBytes: 4096 });
+    port = server.wss.address().port;
+
+    const first = await connect(port, makeToken("rate-cleanup-client"));
+    const firstJoin = nextMessages(first, 1);
+    first.send(JSON.stringify({ type: "join_room", roomId: "cleanup-rate-room" }));
+    await firstJoin;
+
+    const firstBlocked = nextMessages(first, 1);
+    first.send(JSON.stringify({ type: "leave_room", roomId: "cleanup-rate-room" }));
+    const [blocked] = await firstBlocked;
+    expect(blocked).toEqual({
+      type: "error",
+      payload: { message: "Rate limit exceeded" },
+    });
+
+    await closeAll(first);
+
+    const second = await connect(port, makeToken("rate-cleanup-client"));
+    const secondJoin = nextMessages(second, 1);
+    second.send(JSON.stringify({ type: "join_room", roomId: "cleanup-rate-room" }));
+    const [joined] = await secondJoin;
+
+    expect(joined).toEqual({
+      type: "room_joined",
+      payload: { roomId: "cleanup-rate-room" },
+    });
+
+    delete process.env.MAX_MESSAGES_PER_SECOND;
+    await closeAll(second);
+  });
   it("logs error on ws error event", async () => {
     const errorSpy = vi.spyOn(logger, "error");
     const ws = await connect(port, makeToken("error-client"));

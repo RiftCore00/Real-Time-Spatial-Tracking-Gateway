@@ -5,18 +5,21 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { createRateLimiter } from "./rate-limiter.js";
 
-function safeSend(ws, data) {
-  try {
-    ws.send(typeof data === "string" ? data : JSON.stringify(data));
-  } catch {
-    // Silently ignore send errors (connection may have closed)
-  }
-}
-
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+export function createServer({
+  port,
+  heartbeatMs,
+  maxPayloadBytes,
+  connRateLimit,
+  maxConnectionsPerIp,
+  ringBufferSize,
+  deduplicationWindowMs,
+  maxBufferBytes,
+  maxDedupEntries,
+} = {}) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -45,6 +48,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const rateLimiter = createRateLimiter();
   const ipConnectionCount = new Map();
@@ -60,6 +64,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       ws.close(4029, "Connection rate limit exceeded");
@@ -100,7 +105,8 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     ws.on("message", (raw) => {
       if (!rateLimiter.check(actualClientId)) {
-        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
+        logger.warn("Message rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
         return;
       }
 
@@ -116,7 +122,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
           break;
@@ -125,6 +136,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          break;
+        }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(actualClientId);
+          if (!clientRooms.has(msg.roomId)) {
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Must join room before reconnecting" } }));
+            break;
+          }
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq);
+          ws.send(JSON.stringify(replayResult));
           break;
         }
         case "location_update": {
@@ -151,6 +172,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         } else {
           ipConnectionCount.set(trackedIp, count - 1);
         }
+        connRateLimiter.cleanup(trackedIp);
       }
       logger.info("Client disconnected", {
         clientId: actualClientId,
@@ -180,5 +202,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     server.close();
   });
 
-  return { wss, rooms };
+  return { wss, server, rooms, ipConnectionCount, rateLimiter };
 }
