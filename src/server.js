@@ -5,6 +5,7 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
@@ -36,6 +37,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
@@ -50,6 +52,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       ws.close(4029, "Connection rate limit exceeded");
@@ -127,6 +130,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
       if (trackedIp) {
         const count = ipConnectionCount.get(trackedIp) ?? 1;
