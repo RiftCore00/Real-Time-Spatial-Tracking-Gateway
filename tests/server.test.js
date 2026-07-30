@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
 import { logger } from "../src/logger.js";
+import { INVALID_JSON, VALIDATION_ERROR } from "../src/errors.js";
 
 const TEST_SECRET = "test-secret-key";
 
@@ -100,6 +101,21 @@ describe("createServer", () => {
     ws.send("not-json");
     const [msg] = await pending;
     expect(msg.type).toBe("error");
+    expect(msg.payload).toEqual({
+      message: "Invalid JSON",
+      code: INVALID_JSON,
+    });
+    await closeAll(ws);
+  });
+
+  it("sends validation error frame for malformed payload", async () => {
+    const ws = await connect(port, makeToken("client-e"));
+    const pending = nextMessages(ws, 1);
+    ws.send(JSON.stringify({ type: "location_update", payload: { latitude: "invalid" } }));
+    const [msg] = await pending;
+    expect(msg.type).toBe("error");
+    expect(msg.payload.code).toBe(VALIDATION_ERROR);
+    expect(msg.payload.message).toBeTruthy();
     await closeAll(ws);
   });
 
@@ -111,6 +127,30 @@ describe("createServer", () => {
     expect(msg.type).toBe("room_joined");
     expect(msg.payload.roomId).toBe("fleet-1");
     await closeAll(ws);
+  });
+
+  it("sends error frame when join is rejected due to room capacity", async () => {
+    // We override the default limit by setting the env var, then recreating the server
+    await new Promise((resolve) => server.wss.close(resolve));
+    process.env.MAX_ROOM_SIZE = "1";
+    server = createServer({ port: 0, heartbeatMs: 60000, maxPayloadBytes: 4096 });
+    port = server.wss.address().port;
+
+    const ws1 = await connect(port, makeToken("client-e"));
+    const j1 = nextMessages(ws1, 1);
+    ws1.send(JSON.stringify({ type: "join_room", roomId: "full-room" }));
+    await j1;
+
+    const ws2 = await connect(port, makeToken("client-f"));
+    const j2 = nextMessages(ws2, 1);
+    ws2.send(JSON.stringify({ type: "join_room", roomId: "full-room" }));
+    
+    const [msg] = await j2;
+    expect(msg.type).toBe("error");
+    expect(msg.payload.code).toBe("ROOM_FULL");
+    
+    delete process.env.MAX_ROOM_SIZE;
+    await closeAll(ws1, ws2);
   });
 
   it("sends room_left confirmation on leave_room", async () => {
@@ -193,6 +233,41 @@ describe("createServer", () => {
     expect(server.rooms.getRoomSize("cleanup-room")).toBe(0);
   });
 
+
+  it("cleans up message rate limiter state on disconnect", async () => {
+    await new Promise((resolve) => server.wss.close(resolve));
+    process.env.MAX_MESSAGES_PER_SECOND = "1";
+    server = createServer({ port: 0, heartbeatMs: 60000, maxPayloadBytes: 4096 });
+    port = server.wss.address().port;
+
+    const first = await connect(port, makeToken("rate-cleanup-client"));
+    const firstJoin = nextMessages(first, 1);
+    first.send(JSON.stringify({ type: "join_room", roomId: "cleanup-rate-room" }));
+    await firstJoin;
+
+    const firstBlocked = nextMessages(first, 1);
+    first.send(JSON.stringify({ type: "leave_room", roomId: "cleanup-rate-room" }));
+    const [blocked] = await firstBlocked;
+    expect(blocked).toEqual({
+      type: "error",
+      payload: { message: "Rate limit exceeded" },
+    });
+
+    await closeAll(first);
+
+    const second = await connect(port, makeToken("rate-cleanup-client"));
+    const secondJoin = nextMessages(second, 1);
+    second.send(JSON.stringify({ type: "join_room", roomId: "cleanup-rate-room" }));
+    const [joined] = await secondJoin;
+
+    expect(joined).toEqual({
+      type: "room_joined",
+      payload: { roomId: "cleanup-rate-room" },
+    });
+
+    delete process.env.MAX_MESSAGES_PER_SECOND;
+    await closeAll(second);
+  });
   it("logs error on ws error event", async () => {
     const errorSpy = vi.spyOn(logger, "error");
     const ws = await connect(port, makeToken("error-client"));
@@ -215,6 +290,30 @@ describe("createServer", () => {
 
     errorSpy.mockRestore();
     await closeAll(ws);
+  });
+
+  it("stores the resolved clientId on the socket and includes it in zombie logs", async () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const heartbeatServer = createServer({ port: 0, heartbeatMs: 20, maxPayloadBytes: 4096 });
+    const testPort = heartbeatServer.wss.address().port;
+    const ws = await connect(testPort, makeToken("zombie-client"));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const serverWs = Array.from(heartbeatServer.wss.clients)[0];
+    expect(serverWs._clientId).toBe("zombie-client");
+
+    serverWs.isAlive = false;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Terminating zombie connection",
+      expect.objectContaining({ clientId: "zombie-client" })
+    );
+
+    warnSpy.mockRestore();
+    ws.terminate();
+    await new Promise((resolve) => heartbeatServer.wss.close(resolve));
   });
 
   it("closes with 4000 on malformed request URL", () => {

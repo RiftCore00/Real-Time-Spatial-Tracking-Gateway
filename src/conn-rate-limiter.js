@@ -1,7 +1,7 @@
 /**
  * Per-IP connection rate limiter using a sliding 60-second window.
  * @param {number} [maxPerMinute]
- * @returns {{ check: (ip: string) => boolean }}
+ * @returns {{ check: (ip: string) => boolean, cleanup: (ip: string) => void }}
  */
 export function createConnRateLimiter(maxPerMinute) {
   const limit = maxPerMinute ?? (Number(process.env.MAX_CONNECTIONS_PER_IP ?? process.env.CONN_RATE_LIMIT) || 30);
@@ -23,6 +23,16 @@ export function createConnRateLimiter(maxPerMinute) {
       if (timestamps.length >= limit) return false;
       timestamps.push(now);
       return true;
+    },
+
+    /**
+     * Removes the rate-limit state for an IP (call on disconnect).
+     * Prevents unbounded growth of the windows Map over time.
+     *
+     * @param {string} ip
+     */
+    cleanup(ip) {
+      windows.delete(ip);
     },
   };
 }
