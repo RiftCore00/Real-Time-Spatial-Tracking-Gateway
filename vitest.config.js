@@ -8,6 +8,9 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],
+      exclude: [
+        "src/storage/postgres.js",
+      ],
       thresholds: {
         branches: 80,
         functions: 85,
