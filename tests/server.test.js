@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
 import { logger } from "../src/logger.js";
+import { INVALID_JSON, VALIDATION_ERROR } from "../src/errors.js";
 
 const TEST_SECRET = "test-secret-key";
 
@@ -100,6 +101,21 @@ describe("createServer", () => {
     ws.send("not-json");
     const [msg] = await pending;
     expect(msg.type).toBe("error");
+    expect(msg.payload).toEqual({
+      message: "Invalid JSON",
+      code: INVALID_JSON,
+    });
+    await closeAll(ws);
+  });
+
+  it("sends validation error frame for malformed payload", async () => {
+    const ws = await connect(port, makeToken("client-e"));
+    const pending = nextMessages(ws, 1);
+    ws.send(JSON.stringify({ type: "location_update", payload: { latitude: "invalid" } }));
+    const [msg] = await pending;
+    expect(msg.type).toBe("error");
+    expect(msg.payload.code).toBe(VALIDATION_ERROR);
+    expect(msg.payload.message).toBeTruthy();
     await closeAll(ws);
   });
 

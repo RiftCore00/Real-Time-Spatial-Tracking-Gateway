@@ -7,6 +7,9 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { VALIDATION_ERROR } from "./errors.js";
+
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
 import { createRateLimiter } from "./rate-limiter.js";
 
 export function createServer({
@@ -56,6 +59,10 @@ export function createServer({
 
   function heartbeat() {
     this.isAlive = true;
+  }
+
+  function sendError(ws, message, code) {
+    ws.send(JSON.stringify({ type: "error", payload: { message, code } }));
   }
 
   wss.on("connection", (ws, req) => {
@@ -114,6 +121,7 @@ export function createServer({
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
         safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
