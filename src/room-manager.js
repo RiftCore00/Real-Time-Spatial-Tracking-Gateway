@@ -9,44 +9,12 @@ import { WebSocket } from "ws";
  * which is used during disconnection cleanup.
  */
 export class RoomManager {
-  /**
-   * @param {object} [options]
-   * @param {number} [options.maxRoomsPerClient=50]
-   * @param {number} [options.maxMembersPerRoom=10000]
-   * @param {number} [options.maxRooms=10000]
-   * @param {object} [options.circuitBreaker]
-   * @param {boolean} [options.circuitBreaker.enabled=false]
-   * @param {number} [options.circuitBreaker.memoryThresholdBytes]
-   * @param {number} [options.circuitBreaker.recoveryThresholdBytes]
-   */
-  constructor(options = {}) {
-    const {
-      maxRoomsPerClient = 50,
-      maxMembersPerRoom = 10000,
-      maxRooms = 10000,
-      circuitBreaker = {},
-    } = options;
-
-    this._maxRoomsPerClient = maxRoomsPerClient;
-    this._maxMembersPerRoom = maxMembersPerRoom;
-    this._maxRooms = maxRooms;
-
-    const cbMemoryThreshold = circuitBreaker.memoryThresholdBytes ?? 512 * 1024 * 1024;
-    const cbRecoveryThreshold = circuitBreaker.recoveryThresholdBytes ?? Math.floor(cbMemoryThreshold * 0.75);
-
-    this._circuitBreaker = {
-      enabled: circuitBreaker.enabled ?? (circuitBreaker.memoryThresholdBytes != null || circuitBreaker.recoveryThresholdBytes != null),
-      memoryThresholdBytes: cbMemoryThreshold,
-      recoveryThresholdBytes: cbRecoveryThreshold,
-    };
-    this._circuitBreakerState = "CLOSED";
-
+  constructor({ maxRoomSize = Infinity } = {}) {
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
-    /** @type {number} */
-    this._totalMembers = 0;
+    this._maxRoomSize = maxRoomSize;
   }
 
   /** @private */
@@ -81,75 +49,53 @@ export class RoomManager {
     }
   }
 
+  /** @private */
+  _isDuplicate(roomId, message, excludeClientId) {
+    let parsed = message;
+    if (typeof message === "string") {
+      try {
+        parsed = JSON.parse(message);
+      } catch {
+        return false;
+      }
+    }
+    if (parsed && typeof parsed === "object" && parsed.type === "location_update") {
+      const clientId = parsed.payload?.clientId || excludeClientId;
+      const timestamp = parsed.payload?.timestamp;
+      if (clientId && timestamp) {
+        const key = `${roomId}:${clientId}:${timestamp}`;
+        const now = Date.now();
+        if (this._dedupCache.has(key)) {
+          const recordedTime = this._dedupCache.get(key);
+          if (now - recordedTime <= this._deduplicationWindowMs) {
+            return true;
+          }
+        }
+        this._dedupCache.set(key, now);
+        if (this._dedupCache.size > this._maxDedupEntries) {
+          const oldestKey = this._dedupCache.keys().next().value;
+          if (oldestKey !== undefined) {
+            this._dedupCache.delete(oldestKey);
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   join(clientId, roomId, ws) {
     if (clientId == null) throw new TypeError("clientId is required");
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
-    if (this._circuitBreaker.enabled) {
-      const heapUsed = process.memoryUsage().heapUsed;
-      if (this._circuitBreakerState === "CLOSED") {
-        if (heapUsed > this._circuitBreaker.memoryThresholdBytes) {
-          this._circuitBreakerState = "OPEN";
-        }
-      } else if (this._circuitBreakerState === "OPEN") {
-        if (heapUsed < this._circuitBreaker.recoveryThresholdBytes) {
-          this._circuitBreakerState = "CLOSED";
-        }
-      }
-
-      if (this._circuitBreakerState === "OPEN") {
-        return {
-          type: "error",
-          payload: {
-            code: "CIRCUIT_BREAKER_OPEN",
-            message: "Circuit breaker is open due to high resource pressure",
-          },
-        };
-      }
+    const room = this._ensureRoom(roomId);
+    if (!room.has(clientId) && room.size >= this._maxRoomSize) {
+      return { ok: false, reason: 'ROOM_FULL' };
     }
 
-    const roomExists = this._rooms.has(roomId);
-    if (!roomExists && this._rooms.size >= this._maxRooms) {
-      return {
-        type: "error",
-        payload: {
-          code: "MAX_ROOMS_REACHED",
-          message: `Maximum room count ceiling reached (${this._maxRooms})`,
-        },
-      };
-    }
-
-    const clientRooms = this._clientRooms.get(clientId);
-    const isClientInRoom = clientRooms ? clientRooms.has(roomId) : false;
-
-    if (!isClientInRoom && (clientRooms?.size ?? 0) >= this._maxRoomsPerClient) {
-      return {
-        type: "error",
-        payload: {
-          code: "ROOM_LIMIT_EXCEEDED",
-          message: `Client room limit exceeded (${this._maxRoomsPerClient})`,
-        },
-      };
-    }
-
-    const room = roomExists ? this._rooms.get(roomId) : null;
-    if (!isClientInRoom && (room?.size ?? 0) >= this._maxMembersPerRoom) {
-      return {
-        type: "error",
-        payload: {
-          code: "ROOM_FULL",
-          message: `Room member limit reached (${this._maxMembersPerRoom})`,
-        },
-      };
-    }
-
-    const targetRoom = this._ensureRoom(roomId);
-    if (!targetRoom.has(clientId)) {
-      this._totalMembers++;
-    }
-    targetRoom.set(clientId, ws);
+    room.set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
+    return { ok: true };
   }
 
   /**
@@ -181,7 +127,7 @@ export class RoomManager {
 
   /**
    * Broadcasts a message to every open connection in a room, optionally
-   * excluding the sender.
+   * excluding the sender. Stores message in ring buffer with a sequence number.
    *
    * Objects are serialised to JSON; strings are sent as-is.
    * Clients whose `readyState` is not `OPEN` are silently skipped.
@@ -192,6 +138,45 @@ export class RoomManager {
    */
   broadcast(roomId, message, excludeClientId = null) {
     if (roomId == null) throw new TypeError("roomId is required");
+
+    if (this._isDuplicate(roomId, message, excludeClientId)) {
+      return;
+    }
+
+    const currentSeq = (this._roomSeq.get(roomId) ?? 0) + 1;
+    this._roomSeq.set(roomId, currentSeq);
+
+    let payload = message;
+    if (typeof message === "string") {
+      try {
+        payload = JSON.parse(message);
+      } catch {
+        payload = message;
+      }
+    }
+
+    const entry = {
+      seq: currentSeq,
+      payload,
+      timestamp: Date.now(),
+    };
+
+    if (!this._roomBuffers.has(roomId)) {
+      this._roomBuffers.set(roomId, []);
+      this._roomBufferBytes.set(roomId, 0);
+    }
+
+    const buffer = this._roomBuffers.get(roomId);
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+    let currentBytes = (this._roomBufferBytes.get(roomId) ?? 0) + entryBytes;
+    buffer.push(entry);
+
+    while (buffer.length > 0 && (buffer.length > this._ringBufferSize || currentBytes > this._maxBufferBytes)) {
+      const evicted = buffer.shift();
+      const evictedBytes = Buffer.byteLength(JSON.stringify(evicted), "utf8");
+      currentBytes -= evictedBytes;
+    }
+    this._roomBufferBytes.set(roomId, Math.max(0, currentBytes));
 
     const room = this._rooms.get(roomId);
     if (!room) return;
@@ -208,6 +193,72 @@ export class RoomManager {
         }
       }
     }
+  }
+
+  /**
+   * Returns the current sequence number for a room.
+   *
+   * @param {string} roomId - Identifier of the room.
+   * @returns {number} Current sequence number, or 0 if room has no broadcasts.
+   */
+  getRoomSeq(roomId) {
+    if (roomId == null) throw new TypeError("roomId is required");
+    return this._roomSeq.get(roomId) ?? 0;
+  }
+
+  /**
+   * Returns the array of stored ring buffer entries for a room in order.
+   *
+   * @param {string} roomId - Identifier of the room.
+   * @returns {Array<{ seq: number, payload: any, timestamp: number }>}
+   */
+  getRingBuffer(roomId) {
+    if (roomId == null) throw new TypeError("roomId is required");
+    const buffer = this._roomBuffers.get(roomId);
+    return buffer ? [...buffer] : [];
+  }
+
+  /**
+   * Evaluates a reconnection request against stored room sequence and ring buffer.
+   *
+   * @param {string} roomId - Identifier of the target room.
+   * @param {number} lastSeq - The sequence number last received by the client.
+   * @returns {object} Replay payload (type: "replay", "replay_complete", or "replay_gap").
+   */
+  handleReconnect(roomId, lastSeq) {
+    if (roomId == null) throw new TypeError("roomId is required");
+    if (lastSeq == null) throw new TypeError("lastSeq is required");
+
+    const currentSeq = this.getRoomSeq(roomId);
+    const buffer = this._roomBuffers.get(roomId) ?? [];
+
+    if (lastSeq === currentSeq) {
+      return {
+        type: "replay_complete",
+        roomId,
+      };
+    }
+
+    if (buffer.length > 0) {
+      const oldestSeq = buffer[0].seq;
+      if (lastSeq >= oldestSeq - 1 && lastSeq < currentSeq) {
+        const missed = buffer.filter((entry) => entry.seq > lastSeq);
+        return {
+          type: "replay",
+          roomId,
+          messages: missed,
+          currentSeq,
+        };
+      }
+    }
+
+    const oldestSeq = buffer.length > 0 ? buffer[0].seq : currentSeq;
+    return {
+      type: "replay_gap",
+      roomId,
+      fromSeq: oldestSeq,
+      currentSeq,
+    };
   }
 
   /**
