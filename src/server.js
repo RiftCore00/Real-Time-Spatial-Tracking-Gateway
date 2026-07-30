@@ -16,34 +16,15 @@ function safeSend(ws, data) {
   }
 }
 
+function safeSend(ws, data) {
+  try {
+    ws.send(typeof data === "string" ? data : JSON.stringify(data));
+  } catch {
+    // Silently ignore send errors (connection may have closed)
+  }
+}
+
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
-  const server = http.createServer((req, res) => {
-    let url;
-    try {
-      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    } catch {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Bad Request" }));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "OK" }));
-      return;
-    }
-
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not Found" }));
-  });
-
-  const wss = new WebSocketServer({
-    server,
-    maxPayload: maxPayloadBytes ?? 1024,
-  });
-
-  server.listen(port ?? 8080);
-
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const rateLimiter = createRateLimiter();
@@ -57,13 +38,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     eventLoopLagMs: 0,
   };
 
-  let isReady = false;
   let isShuttingDown = false;
-
-  const wss = new WebSocketServer({
-    noServer: true,
-    maxPayload: maxPayloadBytes ?? 1024,
-  });
 
   const httpServer = http.createServer((req, res) => {
     if (req.method !== "GET") {
@@ -74,23 +49,22 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     const pathname = new URL(req.url, `http://${req.headers.host ?? "localhost"}`).pathname;
 
-    if (pathname === "/healthz") {
-      if (isShuttingDown) {
+    if (pathname === "/health" || pathname === "/healthz") {
+      if (isShuttingDown && pathname === "/healthz") {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "shutting down" }));
         return;
       }
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+      if (pathname === "/healthz") {
+        res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+      } else {
+        res.end(JSON.stringify({ status: "OK" }));
+      }
     } else if (pathname === "/readyz") {
       if (isShuttingDown) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "not ready", reason: "server is shutting down" }));
-        return;
-      }
-      if (!isReady) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "not ready", reason: "initializing" }));
         return;
       }
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -122,16 +96,21 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(lines.join("\n") + "\n");
     } else {
-      res.writeHead(404);
-      res.end("Not Found");
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not Found" }));
     }
   });
 
-  httpServer.on("upgrade", (req, socket, head) => {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+  httpServer.listen(port ?? 8080);
+
+  const wss = new WebSocketServer({
+    server: httpServer,
+    maxPayload: maxPayloadBytes ?? 1024,
   });
+
+  function markShuttingDown() {
+    isShuttingDown = true;
+  }
 
   function heartbeat() {
     this.isAlive = true;
@@ -265,8 +244,8 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   }, heartbeatMs ?? 30000);
 
   wss.on("close", () => {
-    clearInterval(interval);
-    server.close();
+    clearInterval(heartbeatInterval);
+    httpServer.close();
   });
 
   return { wss, rooms };
