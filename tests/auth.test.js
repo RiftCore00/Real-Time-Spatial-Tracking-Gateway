@@ -4,7 +4,7 @@ describe("auth", () => {
   it("rejects connection when AUTH_SECRET is not configured", async () => {
     process.env.AUTH_SECRET = "";
     const { verifyConnection } = await import("../src/auth.js");
-    const result = verifyConnection(null);
+    const result = await verifyConnection(null);
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/AUTH_SECRET|misconfiguration/i);
   });
@@ -12,7 +12,7 @@ describe("auth", () => {
   it("rejects a missing token when secret is set", async () => {
     process.env.AUTH_SECRET = "test-secret";
     const { verifyConnection } = await import("../src/auth.js?2");
-    const result = verifyConnection(null);
+    const result = await verifyConnection(null);
     expect(result.ok).toBe(false);
     expect(result.error).toBeTruthy();
   });
@@ -20,7 +20,7 @@ describe("auth", () => {
   it("rejects an invalid token when secret is set", async () => {
     process.env.AUTH_SECRET = "test-secret";
     const { verifyConnection } = await import("../src/auth.js?3");
-    const result = verifyConnection("bad-token");
+    const result = await verifyConnection("bad-token");
     expect(result.ok).toBe(false);
     expect(result.error).toBeTruthy();
   });

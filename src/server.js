@@ -97,7 +97,7 @@ export function createServer({
     }
 
     const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+    const authResult = await verifyConnection(token);
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
@@ -164,6 +164,16 @@ export function createServer({
               type: "location_update",
               payload: { clientId: actualClientId, ...msg.payload },
             }, actualClientId);
+          }
+          break;
+        }
+        case "token_refresh": {
+          const result = await verifyConnection(msg.token);
+          if (result.ok) {
+            actualClientId = result.clientId;
+            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
           }
           break;
         }
