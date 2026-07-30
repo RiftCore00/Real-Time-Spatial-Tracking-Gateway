@@ -99,6 +99,7 @@ cp .env.example .env
 | `PORT`                | `8080`               | WebSocket server listen port          |
 | `WS_HEARTBEAT_MS`     | `30000`              | Interval for connection pings         |
 | `MAX_PAYLOAD_BYTES`   | `1024`               | Maximum incoming message size         |
+| `MAX_ROOM_SIZE`       | `Infinity`           | Maximum number of clients in a room   |
 | `DATABASE_URL`        | —                    | Connection string for storage adapter |
 | `AUTH_SECRET`         | —                    | Secret for token verification         |
 
@@ -162,12 +163,22 @@ All messages are JSON-encoded. Every message **must** contain a `type` field:
 
 ### Server-to-Client Messages
 
-| Type               | Description                               |
-|--------------------|-------------------------------------------|
-| `location_update`  | Broadcast from another room member        |
-| `room_joined`      | Confirmation of room join                 |
-| `room_left`        | Confirmation of room leave                |
-| `error`            | Validation error or server error          |
+| Type               | Description                                                                 |
+|--------------------|-----------------------------------------------------------------------------|
+| `location_update`  | Broadcast from another room member                                          |
+| `room_joined`      | Confirmation of room join                                                    |
+| `room_left`        | Confirmation of room leave                                                   |
+| `error`            | Validation error or server error. Payload includes `message` and `code`.    |
+
+#### Error codes
+
+The `error` frame payload includes a machine-readable `code` field that clients should use to handle failures programmatically.
+
+- `INVALID_JSON` — malformed JSON input.
+- `VALIDATION_ERROR` — message schema or payload validation failed.
+- `RATE_LIMITED` — request rejected due to connection or rate limits.
+- `ROOM_FULL` — room join request rejected because the room is full.
+- `AUTH_FAILED` — authentication failed.
 
 ---
 

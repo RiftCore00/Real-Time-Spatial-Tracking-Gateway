@@ -5,9 +5,24 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { VALIDATION_ERROR } from "./errors.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+import { createRateLimiter } from "./rate-limiter.js";
+
+export function createServer({
+  port,
+  heartbeatMs,
+  maxPayloadBytes,
+  connRateLimit,
+  maxConnectionsPerIp,
+  ringBufferSize,
+  deduplicationWindowMs,
+  maxBufferBytes,
+  maxDedupEntries,
+} = {}) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -36,12 +51,18 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   server.listen(port ?? 8080);
 
   const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
+  const rateLimiter = createRateLimiter();
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
   function heartbeat() {
     this.isAlive = true;
+  }
+
+  function sendError(ws, message, code) {
+    ws.send(JSON.stringify({ type: "error", payload: { message, code } }));
   }
 
   wss.on("connection", (ws, req) => {
@@ -50,6 +71,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       ws.close(4029, "Connection rate limit exceeded");
@@ -75,7 +97,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+    const authResult = await verifyConnection(token);
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
@@ -84,16 +106,24 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const actualClientId = authResult.clientId ?? clientId;
+    ws._clientId = actualClientId;
     logger.info("Client connected", { clientId: actualClientId, ip });
 
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
+      if (!rateLimiter.check(actualClientId)) {
+        logger.warn("Message rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        return;
+      }
+
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
-        ws.send(JSON.stringify({ type: "error", payload: { message: validation.error } }));
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
+        safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
 
@@ -101,15 +131,30 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_joined", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
-          ws.send(JSON.stringify({ type: "room_left", payload: { roomId: msg.roomId } }));
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          break;
+        }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(actualClientId);
+          if (!clientRooms.has(msg.roomId)) {
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Must join room before reconnecting" } }));
+            break;
+          }
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq);
+          ws.send(JSON.stringify(replayResult));
           break;
         }
         case "location_update": {
@@ -122,11 +167,22 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           }
           break;
         }
+        case "token_refresh": {
+          const result = await verifyConnection(msg.token);
+          if (result.ok) {
+            actualClientId = result.clientId;
+            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
+          }
+          break;
+        }
       }
     });
 
     ws.on("close", (code, reason) => {
       rooms.disconnect(actualClientId);
+      rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
       if (trackedIp) {
         const count = ipConnectionCount.get(trackedIp) ?? 1;
@@ -135,6 +191,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         } else {
           ipConnectionCount.set(trackedIp, count - 1);
         }
+        connRateLimiter.cleanup(trackedIp);
       }
       logger.info("Client disconnected", {
         clientId: actualClientId,
@@ -151,7 +208,9 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
+        logger.warn("Terminating zombie connection", {
+          clientId: ws._clientId ?? ws._trackedIp ?? "unknown",
+        });
         return ws.terminate();
       }
       ws.isAlive = false;
@@ -164,5 +223,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     server.close();
   });
 
-  return { wss, server, rooms, ipConnectionCount };
+  return { wss, server, rooms, ipConnectionCount, rateLimiter };
 }

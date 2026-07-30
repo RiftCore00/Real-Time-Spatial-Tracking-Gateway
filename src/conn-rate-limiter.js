@@ -4,7 +4,7 @@
  * and check() uses batch filter() instead of O(n) shift().
  *
  * @param {number} [maxPerMinute]
- * @returns {{ check: (ip: string) => boolean, remove: (ip: string) => void, cleanup: () => void, size: number }}
+ * @returns {{ check: (ip: string) => boolean, cleanup: (ip: string) => void }}
  */
 export function createConnRateLimiter(maxPerMinute) {
   const limit = maxPerMinute ?? (Number(process.env.MAX_CONNECTIONS_PER_IP ?? process.env.CONN_RATE_LIMIT) || 30);
@@ -40,36 +40,12 @@ export function createConnRateLimiter(maxPerMinute) {
 
     /**
      * Removes the rate-limit state for an IP (call on disconnect).
+     * Prevents unbounded growth of the windows Map over time.
      *
      * @param {string} ip
      */
-    remove(ip) {
+    cleanup(ip) {
       windows.delete(ip);
-    },
-
-    /**
-     * Iterates all tracked IPs and evicts stale entries.
-     * Keys with no remaining timestamps within the window are removed entirely.
-     * This is safe to call from a periodic timer (e.g. every 30s).
-     */
-    cleanup() {
-      const cutoff = Date.now() - 60_000;
-      for (const [ip, timestamps] of windows) {
-        const filtered = timestamps.filter(t => t > cutoff);
-        if (filtered.length === 0) {
-          windows.delete(ip);
-        } else {
-          windows.set(ip, filtered);
-        }
-      }
-    },
-
-    /**
-     * Returns the number of distinct IPs currently tracked by this limiter.
-     * @returns {number}
-     */
-    get size() {
-      return windows.size;
     },
   };
 }

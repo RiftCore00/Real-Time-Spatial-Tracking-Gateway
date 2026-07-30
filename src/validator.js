@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { logger } from "./logger.js";
+import { INVALID_JSON, VALIDATION_ERROR } from "./errors.js";
 
 const locationPayloadSchema = z.object({
   latitude: z.number().min(-90).max(90),
@@ -18,6 +19,11 @@ const leaveRoomSchema = z.object({
   roomId: z.string().min(1).max(128),
 });
 
+const reconnectSchema = z.object({
+  roomId: z.string().min(1).max(128),
+  lastSeq: z.number().min(0),
+});
+
 const messageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("location_update"),
@@ -31,12 +37,17 @@ const messageSchema = z.discriminatedUnion("type", [
     type: z.literal("leave_room"),
     ...leaveRoomSchema.shape,
   }),
+  z.object({
+    type: z.literal("reconnect"),
+    ...reconnectSchema.shape,
+  }),
 ]);
 
 const MESSAGE_SIZE_LIMITS = {
   location_update: 512,
   join_room: 256,
   leave_room: 256,
+  reconnect: 256,
 };
 
 export function validateMessage(raw) {
@@ -45,7 +56,7 @@ export function validateMessage(raw) {
   try {
     parsed = isString ? JSON.parse(raw) : raw;
   } catch {
-    return { ok: false, error: "Invalid JSON" };
+    return { ok: false, error: "Invalid JSON", code: INVALID_JSON };
   }
 
   if (isString) {
@@ -54,14 +65,22 @@ export function validateMessage(raw) {
     if (sizeLimit !== undefined) {
       const byteSize = Buffer.byteLength(raw, "utf8");
       if (byteSize > sizeLimit) {
-        return { ok: false, error: `Message exceeds size limit of ${sizeLimit} bytes for type '${type}'` };
+        return {
+          ok: false,
+          error: `Message exceeds size limit of ${sizeLimit} bytes for type '${type}'`,
+          code: VALIDATION_ERROR,
+        };
       }
     }
   }
 
   const result = messageSchema.safeParse(parsed);
   if (!result.success) {
-    return { ok: false, error: result.error.issues.map(i => i.message).join("; ") };
+    return {
+      ok: false,
+      error: result.error.issues.map(i => i.message).join("; " ),
+      code: VALIDATION_ERROR,
+    };
   }
 
   const skew = Number(process.env.MAX_TIMESTAMP_SKEW_MS ?? 30000);
@@ -72,7 +91,11 @@ export function validateMessage(raw) {
         clientId: parsed.clientId,
         timestamp: result.data.payload.timestamp,
       });
-      return { ok: false, error: "Timestamp is too old or too far in the future" };
+      return {
+        ok: false,
+        error: "Timestamp is too old or too far in the future",
+        code: VALIDATION_ERROR,
+      };
     }
   }
 
