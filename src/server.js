@@ -16,6 +16,14 @@ function safeSend(ws, data) {
   }
 }
 
+function safeSend(ws, data) {
+  try {
+    ws.send(typeof data === "string" ? data : JSON.stringify(data));
+  } catch {
+    // Silently ignore send errors (connection may have closed)
+  }
+}
+
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
   const rooms = new RoomManager();
   const connRateLimiter = createConnRateLimiter(connRateLimit);
@@ -240,5 +248,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     httpServer.close();
   });
 
-  return { wss, httpServer, rooms, markShuttingDown };
+  return { wss, rooms };
 }
