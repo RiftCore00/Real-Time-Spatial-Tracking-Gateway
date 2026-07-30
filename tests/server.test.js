@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import jwt from "jsonwebtoken";
 import { createServer } from "../src/server.js";
 import { logger } from "../src/logger.js";
+import { INVALID_JSON, VALIDATION_ERROR } from "../src/errors.js";
 
 const TEST_SECRET = "test-secret-key";
 
@@ -100,6 +101,21 @@ describe("createServer", () => {
     ws.send("not-json");
     const [msg] = await pending;
     expect(msg.type).toBe("error");
+    expect(msg.payload).toEqual({
+      message: "Invalid JSON",
+      code: INVALID_JSON,
+    });
+    await closeAll(ws);
+  });
+
+  it("sends validation error frame for malformed payload", async () => {
+    const ws = await connect(port, makeToken("client-e"));
+    const pending = nextMessages(ws, 1);
+    ws.send(JSON.stringify({ type: "location_update", payload: { latitude: "invalid" } }));
+    const [msg] = await pending;
+    expect(msg.type).toBe("error");
+    expect(msg.payload.code).toBe(VALIDATION_ERROR);
+    expect(msg.payload.message).toBeTruthy();
     await closeAll(ws);
   });
 
@@ -274,6 +290,30 @@ describe("createServer", () => {
 
     errorSpy.mockRestore();
     await closeAll(ws);
+  });
+
+  it("stores the resolved clientId on the socket and includes it in zombie logs", async () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const heartbeatServer = createServer({ port: 0, heartbeatMs: 20, maxPayloadBytes: 4096 });
+    const testPort = heartbeatServer.wss.address().port;
+    const ws = await connect(testPort, makeToken("zombie-client"));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const serverWs = Array.from(heartbeatServer.wss.clients)[0];
+    expect(serverWs._clientId).toBe("zombie-client");
+
+    serverWs.isAlive = false;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Terminating zombie connection",
+      expect.objectContaining({ clientId: "zombie-client" })
+    );
+
+    warnSpy.mockRestore();
+    ws.terminate();
+    await new Promise((resolve) => heartbeatServer.wss.close(resolve));
   });
 
   it("closes with 4000 on malformed request URL", () => {

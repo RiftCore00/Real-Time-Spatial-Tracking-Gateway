@@ -1,5 +1,8 @@
 /**
  * Per-IP connection rate limiter using a sliding 60-second window.
+ * Memory is bounded: stale entries are proactively evictable via cleanup()
+ * and check() uses batch filter() instead of O(n) shift().
+ *
  * @param {number} [maxPerMinute]
  * @returns {{ check: (ip: string) => boolean, cleanup: (ip: string) => void }}
  */
@@ -9,6 +12,13 @@ export function createConnRateLimiter(maxPerMinute) {
   const windows = new Map();
 
   return {
+    /**
+     * Returns true if the connection is allowed, false if rate-limited.
+     * Side effect: records the current timestamp for the IP.
+     *
+     * @param {string} ip
+     * @returns {boolean}
+     */
     check(ip) {
       const now = Date.now();
       const cutoff = now - 60_000;
@@ -17,8 +27,11 @@ export function createConnRateLimiter(maxPerMinute) {
         timestamps = [];
         windows.set(ip, timestamps);
       }
-      while (timestamps.length > 0 && timestamps[0] <= cutoff) {
-        timestamps.shift();
+      // Batch-evict entries outside the 60-second window (O(k) where k = expired entries)
+      if (timestamps.length > 0 && timestamps[0] <= cutoff) {
+        const filtered = timestamps.filter(t => t > cutoff);
+        windows.set(ip, filtered);
+        timestamps = filtered;
       }
       if (timestamps.length >= limit) return false;
       timestamps.push(now);

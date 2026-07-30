@@ -7,6 +7,10 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { VALIDATION_ERROR } from "./errors.js";
+
+export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
+import { createRateLimiter } from "./rate-limiter.js";
 
 export function createServer({
   port,
@@ -56,10 +60,8 @@ export function createServer({
     this.isAlive = true;
   }
 
-  function safeSend(ws, data) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(data));
-    }
+  function sendError(ws, message, code) {
+    ws.send(JSON.stringify({ type: "error", payload: { message, code } }));
   }
 
   wss.on("connection", (ws, req) => {
@@ -94,7 +96,7 @@ export function createServer({
     }
 
     const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+    const authResult = await verifyConnection(token);
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
@@ -103,6 +105,7 @@ export function createServer({
     }
 
     const actualClientId = authResult.clientId ?? clientId;
+    ws._clientId = actualClientId;
     logger.info("Client connected", { clientId: actualClientId, ip });
 
     ws.on("pong", heartbeat);
@@ -118,6 +121,7 @@ export function createServer({
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
         safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
@@ -162,6 +166,16 @@ export function createServer({
           }
           break;
         }
+        case "token_refresh": {
+          const result = await verifyConnection(msg.token);
+          if (result.ok) {
+            actualClientId = result.clientId;
+            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
+          }
+          break;
+        }
       }
     });
 
@@ -193,7 +207,9 @@ export function createServer({
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
+        logger.warn("Terminating zombie connection", {
+          clientId: ws._clientId ?? ws._trackedIp ?? "unknown",
+        });
         return ws.terminate();
       }
       ws.isAlive = false;

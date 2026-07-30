@@ -112,8 +112,9 @@ export class RoomManager {
     if (roomId == null) throw new TypeError("roomId is required");
 
     const room = this._rooms.get(roomId);
-    if (room) {
+    if (room && room.has(clientId)) {
       room.delete(clientId);
+      this._totalMembers--;
       this._cleanupRoom(roomId);
     }
 
@@ -272,6 +273,7 @@ export class RoomManager {
 
     const rooms = this._clientRooms.get(clientId);
     if (rooms) {
+      this._totalMembers -= rooms.size;
       for (const roomId of rooms) {
         const room = this._rooms.get(roomId);
         if (room) {
@@ -323,5 +325,18 @@ export class RoomManager {
    */
   get clientCount() {
     return this._clientRooms.size;
+  }
+
+  /**
+   * RoomManager statistics and metrics.
+   * @type {{ roomCount: number, clientCount: number, totalMembers: number, circuitBreakerState: string }}
+   */
+  get stats() {
+    return {
+      roomCount: this._rooms.size,
+      clientCount: this._clientRooms.size,
+      totalMembers: this._totalMembers,
+      circuitBreakerState: this._circuitBreakerState,
+    };
   }
 }
