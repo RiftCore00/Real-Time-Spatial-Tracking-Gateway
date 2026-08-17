@@ -7,14 +7,7 @@ import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { createRateLimiter } from "./rate-limiter.js";
-
-function safeSend(ws, data) {
-  try {
-    ws.send(typeof data === "string" ? data : JSON.stringify(data));
-  } catch {
-    // Silently ignore send errors (connection may have closed)
-  }
-}
+import { SessionManager } from "./session-manager.js";
 
 function safeSend(ws, data) {
   try {
@@ -31,11 +24,14 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
+  const sessionManager = new SessionManager();
+
   const metrics = {
     messages: { location_update: 0, join_room: 0, leave_room: 0 },
     authFailures: 0,
     rateLimitRejections: { connection: 0 },
     eventLoopLagMs: 0,
+    sessionResumption: { success: 0, decrypt_failed: 0, expired: 0, mismatch: 0, new_session: 0 },
   };
 
   let isShuttingDown = false;
@@ -88,6 +84,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
         "# TYPE gateway_auth_failures_total counter",
         `gateway_auth_failures_total ${metrics.authFailures}`,
+        "# TYPE session_resumption_total counter",
+        `session_resumption_total{result="success"} ${metrics.sessionResumption.success}`,
+        `session_resumption_total{result="decrypt_failed"} ${metrics.sessionResumption.decrypt_failed}`,
+        `session_resumption_total{result="expired"} ${metrics.sessionResumption.expired}`,
+        `session_resumption_total{result="mismatch"} ${metrics.sessionResumption.mismatch}`,
+        `session_resumption_total{result="new_session"} ${metrics.sessionResumption.new_session}`,
         "# TYPE gateway_heap_used_bytes gauge",
         `gateway_heap_used_bytes ${mem.heapUsed}`,
         "# TYPE gateway_event_loop_lag_ms gauge",
@@ -159,7 +161,40 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const actualClientId = authResult.clientId ?? clientId;
-    logger.info("Client connected", { clientId: actualClientId, ip });
+    let sessionResumed = false;
+    let restoredRooms = [];
+
+    const sessionId = url.searchParams.get("session_id");
+    if (sessionId) {
+      sessionManager.load(sessionId).then((restored) => {
+        if (restored && restored.clientId === actualClientId) {
+          sessionResumed = true;
+          restoredRooms = restored.rooms || [];
+          for (const room of restoredRooms) {
+            rooms.join(actualClientId, room.roomId, ws);
+          }
+          metrics.sessionResumption.success++;
+          logger.info("Session resumed", { clientId: actualClientId, sessionId, rooms: restoredRooms.map((r) => r.roomId) });
+          safeSend(ws, {
+            type: "session_resumed",
+            payload: {
+              rooms: restoredRooms.map((r) => r.roomId),
+              currentSeqPerRoom: restoredRooms.map((r) => ({ roomId: r.roomId, seq: r.highestReceivedSeq })),
+            },
+          });
+        } else if (restored && restored.clientId !== actualClientId) {
+          metrics.sessionResumption.mismatch++;
+          logger.warn("Session identity mismatch", { clientId: actualClientId, sessionId });
+        } else {
+          metrics.sessionResumption.new_session++;
+          logger.info("No valid session found", { clientId: actualClientId, sessionId });
+        }
+      }).catch(() => {
+        metrics.sessionResumption.decrypt_failed++;
+      });
+    }
+
+    logger.info("Client connected", { clientId: actualClientId, ip, sessionResumed });
 
     ws.on("pong", heartbeat);
 
@@ -185,6 +220,22 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           metrics.messages.join_room++;
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+
+          const currentRooms = rooms.getClientRooms(actualClientId);
+          const roomStates = Array.from(currentRooms).map((roomId) => ({
+            roomId,
+            highestAckedSeq: 0,
+            highestReceivedSeq: 0,
+            geofenceInsideSet: [],
+          }));
+          sessionManager.debouncedSave(actualClientId, {
+            clientId: actualClientId,
+            protocolVersion: 3,
+            authIdentity: authResult,
+            rooms: roomStates,
+            rateLimitState: { messageWindow: [], connectionWindow: [] },
+            metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+          });
           break;
         }
         case "leave_room": {
@@ -192,6 +243,22 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           metrics.messages.leave_room++;
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+
+          const currentRooms = rooms.getClientRooms(actualClientId);
+          const roomStates = Array.from(currentRooms).map((roomId) => ({
+            roomId,
+            highestAckedSeq: 0,
+            highestReceivedSeq: 0,
+            geofenceInsideSet: [],
+          }));
+          sessionManager.debouncedSave(actualClientId, {
+            clientId: actualClientId,
+            protocolVersion: 3,
+            authIdentity: authResult,
+            rooms: roomStates,
+            rateLimitState: { messageWindow: [], connectionWindow: [] },
+            metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+          });
           break;
         }
         case "location_update": {
@@ -209,6 +276,22 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     });
 
     ws.on("close", (code, reason) => {
+      const currentRooms = rooms.getClientRooms(actualClientId);
+      const roomStates = Array.from(currentRooms).map((roomId) => ({
+        roomId,
+        highestAckedSeq: 0,
+        highestReceivedSeq: 0,
+        geofenceInsideSet: [],
+      }));
+      sessionManager.save(actualClientId, {
+        clientId: actualClientId,
+        protocolVersion: 3,
+        authIdentity: authResult,
+        rooms: roomStates,
+        rateLimitState: { messageWindow: [], connectionWindow: [] },
+        metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+      }).catch(() => {});
+
       rooms.disconnect(actualClientId);
       rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
@@ -248,5 +331,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     httpServer.close();
   });
 
-  return { wss, rooms };
+  return { wss, httpServer, markShuttingDown, rooms, sessionManager };
 }

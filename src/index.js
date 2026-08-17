@@ -34,8 +34,9 @@ if (isNaN(config.maxPayloadBytes) || config.maxPayloadBytes < 1) {
 let wss;
 let httpServer;
 let markShuttingDown;
+let sessionManager;
 try {
-  ({ wss, httpServer, markShuttingDown } = createServer(config));
+  ({ wss, httpServer, markShuttingDown, sessionManager } = createServer(config));
 } catch (err) {
   logger.error("Failed to start server", { error: err.message });
   process.exit(1);
@@ -55,8 +56,12 @@ logger.info("Gateway started", config);
  */
 export function shutdown(server, signal) {
   logger.info("Shutting down", { signal });
+  if (sessionManager) {
+    sessionManager.flushPending().catch(() => {});
+  }
   server.close(() => {
     logger.info("Server closed");
+    if (sessionManager) sessionManager.destroy();
     process.exit(0);
   });
   setTimeout(() => {
