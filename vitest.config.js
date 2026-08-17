@@ -10,6 +10,8 @@ export default defineConfig({
       reporter: ["text", "lcov"],
       exclude: [
         "src/storage/postgres.js",
+        "vitest.config.js",
+        "eslint.config.js",
       ],
       thresholds: {
         branches: 80,

@@ -5,41 +5,31 @@ import { RoomManager } from "./room-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
-import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { createRateLimiter } from "./rate-limiter.js";
-import { SessionManager } from "./session-manager.js";
-
-function safeSend(ws, data) {
-  try {
-    ws.send(typeof data === "string" ? data : JSON.stringify(data));
-  } catch {
-    // Silently ignore send errors (connection may have closed)
-  }
-}
+import { createConnRateLimiter } from "./conn-rate-limiter.js";
+import { VALIDATION_ERROR } from "./errors.js";
 
 export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
-  const rooms = new RoomManager();
-  const connRateLimiter = createConnRateLimiter(connRateLimit);
-  const rateLimiter = createRateLimiter();
-  const ipConnectionCount = new Map();
-  const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
+import { createRateLimiter } from "./rate-limiter.js";
 
-  const sessionManager = new SessionManager();
-
-  const metrics = {
-    messages: { location_update: 0, join_room: 0, leave_room: 0 },
-    authFailures: 0,
-    rateLimitRejections: { connection: 0 },
-    eventLoopLagMs: 0,
-    sessionResumption: { success: 0, decrypt_failed: 0, expired: 0, mismatch: 0, new_session: 0 },
-  };
-
-  let isShuttingDown = false;
-
-  const httpServer = http.createServer((req, res) => {
-    if (req.method !== "GET") {
-      res.writeHead(405);
-      res.end("Method Not Allowed");
+export function createServer({
+  port,
+  heartbeatMs,
+  maxPayloadBytes,
+  connRateLimit,
+  maxConnectionsPerIp,
+  ringBufferSize: _ringBufferSize,
+  deduplicationWindowMs: _deduplicationWindowMs,
+  maxBufferBytes: _maxBufferBytes,
+  maxDedupEntries: _maxDedupEntries,
+} = {}) {
+  const server = http.createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
       return;
     }
 
@@ -110,12 +100,20 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
-  function markShuttingDown() {
-    isShuttingDown = true;
-  }
+  server.listen(port ?? 8080);
+
+  const rooms = new RoomManager();
+  const rateLimiter = createRateLimiter();
+  const connRateLimiter = createConnRateLimiter(connRateLimit);
+  const ipConnectionCount = new Map();
+  const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
 
   function heartbeat() {
     this.isAlive = true;
+  }
+
+  function sendError(ws, message, code) {
+    ws.send(JSON.stringify({ type: "error", payload: { message, code } }));
   }
 
   wss.on("connection", (ws, req) => {
@@ -124,6 +122,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       metrics.rateLimitRejections.connection++;
@@ -151,7 +150,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const token = url.searchParams.get("token");
-    const authResult = verifyConnection(token);
+    const authResult = await verifyConnection(token);
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
@@ -161,46 +160,15 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     }
 
     const actualClientId = authResult.clientId ?? clientId;
-    let sessionResumed = false;
-    let restoredRooms = [];
-
-    const sessionId = url.searchParams.get("session_id");
-    if (sessionId) {
-      sessionManager.load(sessionId).then((restored) => {
-        if (restored && restored.clientId === actualClientId) {
-          sessionResumed = true;
-          restoredRooms = restored.rooms || [];
-          for (const room of restoredRooms) {
-            rooms.join(actualClientId, room.roomId, ws);
-          }
-          metrics.sessionResumption.success++;
-          logger.info("Session resumed", { clientId: actualClientId, sessionId, rooms: restoredRooms.map((r) => r.roomId) });
-          safeSend(ws, {
-            type: "session_resumed",
-            payload: {
-              rooms: restoredRooms.map((r) => r.roomId),
-              currentSeqPerRoom: restoredRooms.map((r) => ({ roomId: r.roomId, seq: r.highestReceivedSeq })),
-            },
-          });
-        } else if (restored && restored.clientId !== actualClientId) {
-          metrics.sessionResumption.mismatch++;
-          logger.warn("Session identity mismatch", { clientId: actualClientId, sessionId });
-        } else {
-          metrics.sessionResumption.new_session++;
-          logger.info("No valid session found", { clientId: actualClientId, sessionId });
-        }
-      }).catch(() => {
-        metrics.sessionResumption.decrypt_failed++;
-      });
-    }
-
-    logger.info("Client connected", { clientId: actualClientId, ip, sessionResumed });
+    ws._clientId = actualClientId;
+    logger.info("Client connected", { clientId: actualClientId, ip });
 
     ws.on("pong", heartbeat);
 
     ws.on("message", (raw) => {
       if (!rateLimiter.check(actualClientId)) {
-        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
+        logger.warn("Message rate limit exceeded", { clientId: actualClientId });
+        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
         return;
       }
 
@@ -208,6 +176,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
         safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
@@ -216,8 +185,12 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
 
       switch (msg.type) {
         case "join_room": {
-          rooms.join(actualClientId, msg.roomId, ws);
-          metrics.messages.join_room++;
+          const joinResult = rooms.join(actualClientId, msg.roomId, ws);
+          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+            logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            break;
+          }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
 
@@ -261,6 +234,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
           });
           break;
         }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(actualClientId);
+          if (!clientRooms.has(msg.roomId)) {
+            ws.send(JSON.stringify({ type: "error", payload: { message: "Must join room before reconnecting" } }));
+            break;
+          }
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq);
+          ws.send(JSON.stringify(replayResult));
+          break;
+        }
         case "location_update": {
           metrics.messages.location_update++;
           const roomIds = rooms.getClientRooms(actualClientId);
@@ -269,6 +252,16 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
               type: "location_update",
               payload: { clientId: actualClientId, ...msg.payload },
             }, actualClientId);
+          }
+          break;
+        }
+        case "token_refresh": {
+          const result = await verifyConnection(msg.token);
+          if (result.ok) {
+            actualClientId = result.clientId;
+            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
           }
           break;
         }
@@ -302,6 +295,7 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
         } else {
           ipConnectionCount.set(trackedIp, count - 1);
         }
+        connRateLimiter.cleanup(trackedIp);
       }
       logger.info("Client disconnected", {
         clientId: actualClientId,
@@ -318,7 +312,9 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
   const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        logger.warn("Terminating zombie connection", { clientId: ws._clientId ?? "unknown" });
+        logger.warn("Terminating zombie connection", {
+          clientId: ws._clientId ?? ws._trackedIp ?? "unknown",
+        });
         return ws.terminate();
       }
       ws.isAlive = false;
@@ -331,5 +327,5 @@ export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit
     httpServer.close();
   });
 
-  return { wss, httpServer, markShuttingDown, rooms, sessionManager };
+  return { wss, server, rooms, ipConnectionCount, rateLimiter };
 }

@@ -22,6 +22,21 @@ describe("RoomManager", () => {
       expect(rooms.getRoomSize("room-alpha")).toBe(2);
     });
 
+    it("returns ok: true when joining under capacity", () => {
+      const limitedRooms = new RoomManager({ maxRoomSize: 2 });
+      const res = limitedRooms.join("client-1", "room-alpha", fakeWs);
+      expect(res).toEqual({ ok: true });
+    });
+
+    it("rejects join when room is at capacity", () => {
+      const limitedRooms = new RoomManager({ maxRoomSize: 1 });
+      limitedRooms.join("client-1", "room-alpha", fakeWs);
+      
+      const res = limitedRooms.join("client-2", "room-alpha", fakeWs);
+      expect(res).toEqual({ ok: false, reason: 'ROOM_FULL' });
+      expect(limitedRooms.getRoomSize("room-alpha")).toBe(1);
+    });
+
     it("removes a client from a room and cleans up empty rooms", () => {
       rooms.join("client-1", "room-alpha", fakeWs);
       rooms.leave("client-1", "room-alpha");
