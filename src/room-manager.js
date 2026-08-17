@@ -1,5 +1,10 @@
 import { WebSocket } from "ws";
 
+const DEFAULT_RING_BUFFER_SIZE = 100;
+const DEFAULT_MAX_BUFFER_BYTES = 1024 * 1024;
+const DEFAULT_DEDUP_WINDOW_MS = 5000;
+const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
+
 /**
  * Manages room membership and message broadcasting for connected WebSocket clients.
  *
@@ -7,14 +12,66 @@ import { WebSocket } from "ws";
  * `clientId → WebSocket` so broadcasts are O(members). A reverse index
  * (`_clientRooms`) enables O(1) lookup of all rooms a client belongs to,
  * which is used during disconnection cleanup.
+ *
+ * Each room also keeps a monotonic sequence number and a bounded ring buffer of
+ * recent broadcasts so reconnecting clients can replay what they missed.
  */
 export class RoomManager {
-  constructor({ maxRoomSize = Infinity } = {}) {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRoomSize] - Legacy per-room member cap. When set,
+   *   `join()` reports `{ ok }` results instead of an error frame.
+   * @param {number} [options.maxRoomsPerClient] - Max rooms a single client may join.
+   * @param {number} [options.maxMembersPerRoom] - Max members allowed in one room.
+   * @param {number} [options.maxRooms] - Ceiling on the number of live rooms.
+   * @param {{ enabled?: boolean, memoryThresholdBytes?: number, recoveryThresholdBytes?: number }} [options.circuitBreaker]
+   *   Heap-pressure breaker: opens above `memoryThresholdBytes`, closes below `recoveryThresholdBytes`.
+   * @param {number} [options.ringBufferSize] - Replay entries kept per room.
+   * @param {number} [options.maxBufferBytes] - Byte ceiling for one room's replay buffer.
+   * @param {number} [options.deduplicationWindowMs] - TTL of a `location_update` dedup key.
+   * @param {number} [options.maxDedupEntries] - Max dedup keys retained.
+   */
+  constructor({
+    maxRoomSize,
+    maxRoomsPerClient = Infinity,
+    maxMembersPerRoom = Infinity,
+    maxRooms = Infinity,
+    circuitBreaker = {},
+    ringBufferSize = DEFAULT_RING_BUFFER_SIZE,
+    maxBufferBytes = DEFAULT_MAX_BUFFER_BYTES,
+    deduplicationWindowMs = DEFAULT_DEDUP_WINDOW_MS,
+    maxDedupEntries = DEFAULT_MAX_DEDUP_ENTRIES,
+  } = {}) {
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
-    this._maxRoomSize = maxRoomSize;
+
+    this._maxRoomSize = maxRoomSize ?? Infinity;
+    this._legacyJoinResult = maxRoomSize != null;
+    this._maxRoomsPerClient = maxRoomsPerClient;
+    this._maxMembersPerRoom = maxMembersPerRoom;
+    this._maxRooms = maxRooms;
+    this._totalMembers = 0;
+
+    this._circuitBreakerEnabled = circuitBreaker.enabled === true;
+    this._memoryThresholdBytes = circuitBreaker.memoryThresholdBytes ?? Infinity;
+    this._recoveryThresholdBytes = circuitBreaker.recoveryThresholdBytes ?? 0;
+    this._circuitBreakerState = "CLOSED";
+
+    /** @type {Map<string, number>} roomId → last assigned sequence number */
+    this._roomSeq = new Map();
+    /** @type {Map<string, Array<{ seq: number, payload: any, timestamp: number }>>} */
+    this._roomBuffers = new Map();
+    /** @type {Map<string, number>} roomId → approximate buffer size in bytes */
+    this._roomBufferBytes = new Map();
+    this._ringBufferSize = ringBufferSize;
+    this._maxBufferBytes = maxBufferBytes;
+
+    /** @type {Map<string, number>} dedup key → time the message was first seen (ms) */
+    this._dedupCache = new Map();
+    this._deduplicationWindowMs = deduplicationWindowMs;
+    this._maxDedupEntries = maxDedupEntries;
   }
 
   /** @private */
@@ -47,6 +104,34 @@ export class RoomManager {
     if (rooms && rooms.size === 0) {
       this._clientRooms.delete(clientId);
     }
+  }
+
+  /** @private */
+  _rejection(code, message) {
+    return { type: "error", payload: { code, message } };
+  }
+
+  /**
+   * @private
+   * Re-evaluates heap pressure and returns true while the breaker rejects joins.
+   */
+  _circuitBreakerOpen() {
+    if (!this._circuitBreakerEnabled) return false;
+
+    const { heapUsed } = process.memoryUsage();
+    if (this._circuitBreakerState === "OPEN") {
+      if (heapUsed < this._recoveryThresholdBytes) {
+        this._circuitBreakerState = "CLOSED";
+        return false;
+      }
+      return true;
+    }
+
+    if (heapUsed > this._memoryThresholdBytes) {
+      this._circuitBreakerState = "OPEN";
+      return true;
+    }
+    return false;
   }
 
   /** @private */
@@ -83,19 +168,65 @@ export class RoomManager {
     return false;
   }
 
+  /**
+   * Subscribes a client to a room, enforcing the configured DoS limits.
+   *
+   * Re-joining a room the client already occupies only replaces the stored
+   * socket, so it is never rejected by a limit.
+   *
+   * @param {string} clientId - Unique identifier for the client.
+   * @param {string} roomId - Identifier of the room to join.
+   * @param {import("ws").WebSocket} ws - Socket to register for broadcasts.
+   * @returns {undefined | { ok: boolean, reason?: string } | { type: "error", payload: { code: string, message: string } }}
+   *   `{ ok }` when `maxRoomSize` is configured, an error frame when a limit or the
+   *   circuit breaker rejects the join, otherwise `undefined`.
+   */
   join(clientId, roomId, ws) {
     if (clientId == null) throw new TypeError("clientId is required");
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
-    const room = this._ensureRoom(roomId);
-    if (!room.has(clientId) && room.size >= this._maxRoomSize) {
-      return { ok: false, reason: 'ROOM_FULL' };
+    if (this._circuitBreakerOpen()) {
+      return this._rejection(
+        "CIRCUIT_BREAKER_OPEN",
+        "Circuit breaker is open due to high resource pressure",
+      );
     }
 
-    room.set(clientId, ws);
+    const room = this._rooms.get(roomId);
+    const isMember = room?.has(clientId) === true;
+
+    if (!isMember) {
+      const joinedRooms = this._clientRooms.get(clientId)?.size ?? 0;
+      if (joinedRooms >= this._maxRoomsPerClient) {
+        return this._rejection(
+          "ROOM_LIMIT_EXCEEDED",
+          `Client room limit exceeded (${this._maxRoomsPerClient})`,
+        );
+      }
+      if (!room && this._rooms.size >= this._maxRooms) {
+        return this._rejection(
+          "MAX_ROOMS_REACHED",
+          `Maximum room count ceiling reached (${this._maxRooms})`,
+        );
+      }
+      const members = room?.size ?? 0;
+      if (members >= this._maxMembersPerRoom) {
+        return this._rejection(
+          "ROOM_FULL",
+          `Room member limit reached (${this._maxMembersPerRoom})`,
+        );
+      }
+      if (members >= this._maxRoomSize) {
+        return { ok: false, reason: "ROOM_FULL" };
+      }
+    }
+
+    this._ensureRoom(roomId).set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
-    return { ok: true };
+    if (!isMember) this._totalMembers++;
+
+    return this._legacyJoinResult ? { ok: true } : undefined;
   }
 
   /**

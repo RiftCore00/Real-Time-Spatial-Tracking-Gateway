@@ -1,28 +1,124 @@
 import http from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { v4 as uuid } from "uuid";
+import jwt from "jsonwebtoken";
 import { RoomManager } from "./room-manager.js";
+import { SessionManager } from "./session-manager.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
-import { VALIDATION_ERROR } from "./errors.js";
+import { ROOM_FULL, VALIDATION_ERROR } from "./errors.js";
 
-export function createServer({ port, heartbeatMs, maxPayloadBytes, connRateLimit, maxConnectionsPerIp } = {}) {
-import { createRateLimiter } from "./rate-limiter.js";
+const AFFINITY_COOKIE = "GW_AFFINITY";
+const AFFINITY_MAX_AGE_S = 3600;
+const DEFAULT_SESSION_TTL_MS = 3600000;
+const RATE_WINDOW_MS = 1000;
+const MAX_LOCAL_SESSIONS = 10000;
+const MAX_CLOSE_REASON_BYTES = 123;
+const MIGRATE_CLOSE_CODE = 4100;
+const MIGRATE_PATH = /^\/admin\/v1\/clients\/([^/]+)\/migrate$/;
+const PROTOCOL_VERSION = 1;
 
+/**
+ * Reads one cookie out of a raw `Cookie` header.
+ *
+ * @param {unknown} header - Value of the `Cookie` request header.
+ * @param {string} name - Cookie name to look for.
+ * @returns {string|null} The value, or null when absent.
+ */
+function readCookie(header, name) {
+  if (typeof header !== "string") return null;
+  for (const pair of header.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue;
+    if (pair.slice(0, eq).trim() === name) return pair.slice(eq + 1).trim();
+  }
+  return null;
+}
+
+/**
+ * Reads the `sid` claim of an already-verified token. `auth.js` verified the
+ * signature, so decoding without re-verification is safe here.
+ *
+ * @param {string|null|undefined} token
+ * @returns {string|null} The session blob, or null when the claim is absent.
+ */
+function sessionIdFromToken(token) {
+  if (typeof token !== "string" || token.length === 0) return null;
+  let payload;
+  try {
+    payload = jwt.decode(token);
+  } catch {
+    return null;
+  }
+  const sid = payload && typeof payload === "object" ? payload.sid : null;
+  return typeof sid === "string" && sid.length > 0 ? sid : null;
+}
+
+/**
+ * Creates the HTTP health endpoint and the WebSocket gateway on top of it.
+ *
+ * Session resumption is opt-in: it activates when `sessionManager` is injected
+ * or when an encryption key is available, and stays completely inert otherwise.
+ *
+ * @param {object} [options]
+ * @param {number} [options.port] - TCP port to listen on. Defaults to 8080.
+ * @param {number} [options.heartbeatMs] - Ping interval used to detect zombies. Defaults to 30000.
+ * @param {number} [options.maxPayloadBytes] - Max WebSocket frame size. Defaults to 1024.
+ * @param {number} [options.connRateLimit] - New connections allowed per IP per minute.
+ * @param {number} [options.maxConnectionsPerIp] - Concurrent connections allowed per IP.
+ * @param {number} [options.maxMessagesPerSecond] - Per-client message rate limit.
+ * @param {number} [options.ringBufferSize] - Replay entries kept per room.
+ * @param {number} [options.deduplicationWindowMs] - TTL of a `location_update` dedup key.
+ * @param {number} [options.maxBufferBytes] - Byte ceiling for one room's replay buffer.
+ * @param {number} [options.maxDedupEntries] - Max dedup keys retained.
+ * @param {SessionManager} [options.sessionManager] - Pre-built manager; takes precedence over `sessionEncryptionKey`.
+ * @param {string|object} [options.sessionEncryptionKey] - Key (or key map) used to build a manager.
+ *   Falls back to `SESSION_ENCRYPTION_KEY`.
+ * @param {number} [options.sessionTtlMs] - Session TTL. Falls back to `SESSION_TTL_MS`, then 1 hour.
+ * @param {string} [options.instanceId] - Value published in the `GW_AFFINITY` cookie.
+ *   Falls back to `INSTANCE_ID`, then a uuid.
+ * @param {object} [options.redis] - node-redis v4 style client handed to a self-built manager.
+ * @returns {{ wss: WebSocketServer, server: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
+ */
 export function createServer({
   port,
   heartbeatMs,
   maxPayloadBytes,
   connRateLimit,
   maxConnectionsPerIp,
-  ringBufferSize: _ringBufferSize,
-  deduplicationWindowMs: _deduplicationWindowMs,
-  maxBufferBytes: _maxBufferBytes,
-  maxDedupEntries: _maxDedupEntries,
+  maxMessagesPerSecond,
+  ringBufferSize,
+  deduplicationWindowMs,
+  maxBufferBytes,
+  maxDedupEntries,
+  sessionManager,
+  sessionEncryptionKey,
+  sessionTtlMs,
+  instanceId,
+  redis,
 } = {}) {
+  const sessionKey = sessionEncryptionKey ?? process.env.SESSION_ENCRYPTION_KEY ?? null;
+  const sessionTtl = sessionTtlMs ?? (Number(process.env.SESSION_TTL_MS) || DEFAULT_SESSION_TTL_MS);
+  const ownsSessions = sessionManager == null && sessionKey != null;
+  /** @type {SessionManager|null} */
+  const sessions = ownsSessions
+    ? new SessionManager({
+        redis: redis ?? null,
+        encryptionKey: sessionKey,
+        ttlMs: sessionTtl,
+        logger,
+      })
+    : (sessionManager ?? null);
+  const resolvedInstanceId = instanceId ?? process.env.INSTANCE_ID ?? uuid();
+
+  /** @type {Map<string, object>} clientId → live connection context */
+  const liveClients = new Map();
+  /** @type {Map<string, object>} clientId → last known state, for the sticky-cookie path */
+  const localSessions = new Map();
+
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -39,6 +135,32 @@ export function createServer({
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/metrics" && sessions) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(sessions.metrics));
+      return;
+    }
+
+    const migrate = req.method === "POST" ? MIGRATE_PATH.exec(url.pathname) : null;
+    if (migrate) {
+      migrateClient(decodeURIComponent(migrate[1]))
+        .then((blob) => {
+          if (!blob) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Not Found" }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        })
+        .catch((err) => {
+          logger.error("Client migration failed", { error: err.message });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal Server Error" }));
+        });
+      return;
+    }
+
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not Found" }));
   });
@@ -50,23 +172,302 @@ export function createServer({
 
   server.listen(port ?? 8080);
 
-  const rooms = new RoomManager();
-  const rateLimiter = createRateLimiter();
+  const rooms = new RoomManager({
+    maxRoomSize: Number(process.env.MAX_ROOM_SIZE) || 500,
+    ringBufferSize,
+    deduplicationWindowMs,
+    maxBufferBytes,
+    maxDedupEntries,
+  });
+  const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
+  const MAX_MESSAGES_PER_SECOND =
+    maxMessagesPerSecond ?? (Number(process.env.MAX_MESSAGES_PER_SECOND) || 100);
+
+  const HEARTBEAT_MS = heartbeatMs ?? 30000;
+  // A client is a zombie once it stays silent for two ping intervals. The floor
+  // keeps event-loop jitter from reaping healthy clients under tiny intervals.
+  const PONG_TIMEOUT_MS = Math.max(HEARTBEAT_MS * 2, 1000);
 
   function heartbeat() {
-    this.isAlive = true;
+    this._lastPongAt = Date.now();
+  }
+
+  /** Serialises and sends a frame, skipping sockets that are already going away. */
+  function safeSend(ws, message) {
+    if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) return;
+    try {
+      ws.send(typeof message === "string" ? message : JSON.stringify(message));
+    } catch (err) {
+      logger.warn("Failed to send frame", { error: err.message });
+    }
   }
 
   function sendError(ws, message, code) {
-    ws.send(JSON.stringify({ type: "error", payload: { message, code } }));
+    safeSend(ws, { type: "error", payload: { message, code } });
   }
 
-  wss.on("connection", (ws, req) => {
+  /**
+   * Per-connection state that session capture reads from.
+   *
+   * @param {string} clientId
+   * @param {import("http").IncomingMessage} req
+   * @returns {object}
+   */
+  function createContext(clientId, req) {
+    return {
+      clientId,
+      ip: req.socket.remoteAddress,
+      userAgent: req.headers["user-agent"] ?? null,
+      connectedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      /** @type {Map<string, number>} roomId → highest seq the client ACKed via `reconnect` */
+      ackedSeq: new Map(),
+      /** @type {Map<string, string[]>} roomId → opaque geofence set carried across resumptions */
+      geofence: new Map(),
+      /** @type {number[]} timestamps of accepted messages, mirroring the rate-limiter window */
+      messageWindow: [],
+      /** @type {object|null} snapshot taken before teardown wipes room membership */
+      frozenState: null,
+    };
+  }
+
+  /** Drops timestamps outside the rate-limit window and caps the retained count. */
+  function pruneWindow(timestamps, now = Date.now()) {
+    const cutoff = now - RATE_WINDOW_MS;
+    const live = timestamps.filter((ts) => typeof ts === "number" && ts > cutoff);
+    return live.length > MAX_MESSAGES_PER_SECOND ? live.slice(-MAX_MESSAGES_PER_SECOND) : live;
+  }
+
+  /**
+   * Builds the session state for a client from live room and rate-limit state.
+   *
+   * @param {object} ctx
+   * @returns {import("./session-manager.js").SessionState}
+   */
+  function captureState(ctx) {
+    if (ctx.frozenState) return ctx.frozenState;
+    const roomIds = [...rooms.getClientRooms(ctx.clientId)];
+    return {
+      clientId: ctx.clientId,
+      protocolVersion: PROTOCOL_VERSION,
+      authIdentity: { sub: ctx.clientId },
+      rooms: roomIds.map((roomId) => ({
+        roomId,
+        highestAckedSeq: ctx.ackedSeq.get(roomId) ?? 0,
+        highestReceivedSeq: rooms.getRoomSeq(roomId),
+        geofenceInsideSet: ctx.geofence.get(roomId) ?? [],
+      })),
+      rateLimitState: {
+        messageWindow: pruneWindow(ctx.messageWindow),
+        connectionWindow: [],
+      },
+      metadata: {
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        connectedAt: ctx.connectedAt,
+        lastActivityAt: ctx.lastActivityAt,
+      },
+    };
+  }
+
+  /** Keeps the newest state for the sticky-cookie path, bounded by insertion order. */
+  function rememberLocal(clientId, state) {
+    localSessions.delete(clientId);
+    localSessions.set(clientId, state);
+    while (localSessions.size > MAX_LOCAL_SESSIONS) {
+      const oldest = localSessions.keys().next().value;
+      localSessions.delete(oldest);
+    }
+  }
+
+  /** Reads the local cache, dropping entries older than the session TTL. */
+  function readLocal(clientId) {
+    const state = localSessions.get(clientId);
+    if (!state) return null;
+    const lastActivityAt = state.metadata?.lastActivityAt ?? 0;
+    if (Date.now() - lastActivityAt > sessionTtl) {
+      localSessions.delete(clientId);
+      return null;
+    }
+    return state;
+  }
+
+  /**
+   * Marks activity, refreshes the local cache and schedules an encrypted save.
+   *
+   * @param {object|null} ctx
+   */
+  function touchSession(ctx) {
+    if (!sessions || !ctx) return;
+    ctx.lastActivityAt = Date.now();
+    rememberLocal(ctx.clientId, captureState(ctx));
+    sessions.debouncedSave(ctx.clientId, () => captureState(ctx)).catch((err) => {
+      logger.error("Failed to schedule session save", { clientId: ctx.clientId, error: err.message });
+    });
+  }
+
+  /**
+   * Re-applies a decrypted session to this instance and confirms it to the client.
+   *
+   * @param {import("ws").WebSocket} ws
+   * @param {object} ctx
+   * @param {import("./session-manager.js").SessionState} state
+   */
+  function restoreSession(ws, ctx, state) {
+    const restored = [];
+    const skipped = [];
+
+    for (const entry of Array.isArray(state.rooms) ? state.rooms : []) {
+      if (!entry || typeof entry.roomId !== "string") continue;
+      const joinResult = rooms.join(ctx.clientId, entry.roomId, ws);
+      if (joinResult?.type === "error" || joinResult?.ok === false) {
+        skipped.push(entry.roomId);
+        continue;
+      }
+      const highestAckedSeq = Number(entry.highestAckedSeq) || 0;
+      ctx.ackedSeq.set(entry.roomId, highestAckedSeq);
+      ctx.geofence.set(
+        entry.roomId,
+        Array.isArray(entry.geofenceInsideSet) ? entry.geofenceInsideSet : []
+      );
+      restored.push({
+        roomId: entry.roomId,
+        highestAckedSeq,
+        highestReceivedSeq: Number(entry.highestReceivedSeq) || 0,
+      });
+    }
+
+    // Conservative choice: the limiter exposes no window import, so every saved
+    // in-window timestamp is re-consumed to deny a burst after migration.
+    ctx.messageWindow = pruneWindow(state.rateLimitState?.messageWindow ?? []);
+    for (let i = 0; i < ctx.messageWindow.length; i++) rateLimiter.check(ctx.clientId);
+
+    ctx.connectedAt = Number(state.metadata?.connectedAt) || ctx.connectedAt;
+
+    if (skipped.length > 0) {
+      logger.warn("Session rooms skipped on resume", { clientId: ctx.clientId, rooms: skipped });
+    }
+
+    const currentSeqPerRoom = {};
+    for (const room of restored) currentSeqPerRoom[room.roomId] = rooms.getRoomSeq(room.roomId);
+
+    safeSend(ws, { type: "session_resumed", payload: { rooms: restored, currentSeqPerRoom } });
+    logger.info("Session resumed", { clientId: ctx.clientId, rooms: restored.length });
+    touchSession(ctx);
+  }
+
+  /**
+   * Runs the resumption handshake: explicit `session_id` first, then the
+   * sticky-cookie fallback, otherwise a fresh session.
+   *
+   * @param {import("ws").WebSocket} ws
+   * @param {import("http").IncomingMessage} req
+   * @param {URL} url
+   * @param {object} ctx
+   * @param {string|null} token
+   * @returns {Promise<boolean>} True when a session was restored.
+   */
+  async function resumeSession(ws, req, url, ctx, token) {
+    const sessionId = url.searchParams.get("session_id") ?? sessionIdFromToken(token);
+
+    if (sessionId) {
+      // `load()` counts decrypt_failed / expired; success is recorded here,
+      // after the identity check, so a mismatch is not also a success.
+      const state = await sessions.load(sessionId, { countSuccess: false });
+      if (!state) {
+        logger.info("Session not resumable", { clientId: ctx.clientId });
+        return false;
+      }
+      if (state.clientId !== ctx.clientId) {
+        sessions.recordResumption("mismatch");
+        logger.warn("Session identity mismatch", {
+          clientId: ctx.clientId,
+          sessionClientId: state.clientId,
+        });
+        return false;
+      }
+      sessions.recordResumption("success");
+      restoreSession(ws, ctx, state);
+      return true;
+    }
+
+    const affinity = readCookie(req.headers.cookie, AFFINITY_COOKIE);
+    if (affinity === resolvedInstanceId) {
+      const cached = readLocal(ctx.clientId);
+      if (cached) {
+        sessions.recordResumption("success");
+        restoreSession(ws, ctx, cached);
+        return true;
+      }
+    }
+
+    sessions.recordResumption("new_session");
+    return false;
+  }
+
+  /**
+   * Persists a client's state now and hands the blob over as it disconnects.
+   *
+   * @param {string} clientId
+   * @returns {Promise<string|null>} The blob, or null when the client is unknown.
+   */
+  async function migrateClient(clientId) {
+    const ctx = sessions ? liveClients.get(clientId) : null;
+    if (!ctx) return null;
+
+    await sessions.flush(clientId);
+    const state = captureState(ctx);
+    const blob = await sessions.save(clientId, state);
+    rememberLocal(clientId, state);
+
+    if (Buffer.byteLength(blob, "utf8") <= MAX_CLOSE_REASON_BYTES) {
+      ctx.ws.close(MIGRATE_CLOSE_CODE, blob);
+    } else {
+      safeSend(ctx.ws, { type: "migrate", payload: { session_id: blob } });
+      ctx.ws.close(MIGRATE_CLOSE_CODE, "migrated");
+    }
+    logger.info("Client migrated", { clientId });
+    return blob;
+  }
+
+  /**
+   * Flushes pending saves and persists every live client, for graceful shutdown.
+   *
+   * @returns {Promise<Map<string, string>>} clientId → fresh session blob.
+   */
+  async function saveAllSessions() {
+    /** @type {Map<string, string>} */
+    const blobs = new Map();
+    if (!sessions) return blobs;
+
+    await sessions.flushAll();
+    for (const ctx of liveClients.values()) {
+      const state = captureState(ctx);
+      rememberLocal(ctx.clientId, state);
+      try {
+        blobs.set(ctx.clientId, await sessions.save(ctx.clientId, state));
+      } catch (err) {
+        logger.error("Failed to save session", { clientId: ctx.clientId, error: err.message });
+      }
+    }
+    return blobs;
+  }
+
+  if (sessions) {
+    wss.on("headers", (headers) => {
+      headers.push(
+        `Set-Cookie: ${AFFINITY_COOKIE}=${resolvedInstanceId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${AFFINITY_MAX_AGE_S}`
+      );
+    });
+  }
+
+  wss.on("connection", async (ws, req) => {
     const clientId = uuid();
     ws.isAlive = true;
+    ws._lastPongAt = Date.now();
 
     const ip = req.socket.remoteAddress;
 
@@ -104,25 +505,38 @@ export function createServer({
       return;
     }
 
-    const actualClientId = authResult.clientId ?? clientId;
+    let actualClientId = authResult.clientId ?? clientId;
     ws._clientId = actualClientId;
     logger.info("Client connected", { clientId: actualClientId, ip });
 
+    const ctx = sessions ? createContext(actualClientId, req) : null;
+    if (ctx) {
+      ctx.ws = ws;
+      liveClients.set(actualClientId, ctx);
+    }
+    /** @type {Promise<unknown>|null} Frames wait for the handshake so replayed state lands first. */
+    let pendingResume = null;
+
     ws.on("pong", heartbeat);
 
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
+      if (pendingResume) {
+        await pendingResume;
+        pendingResume = null;
+      }
+
       if (!rateLimiter.check(actualClientId)) {
         logger.warn("Message rate limit exceeded", { clientId: actualClientId });
-        ws.send(JSON.stringify({ type: "error", payload: { message: "Rate limit exceeded" } }));
+        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
         return;
       }
+      if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
 
       const validation = validateMessage(raw.toString());
 
       if (!validation.ok) {
         logger.warn("Validation failed", { clientId: actualClientId, error: validation.error });
         sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
-        safeSend(ws, { type: "error", payload: { message: validation.error } });
         return;
       }
 
@@ -131,29 +545,51 @@ export function createServer({
       switch (msg.type) {
         case "join_room": {
           const joinResult = rooms.join(actualClientId, msg.roomId, ws);
-          if (!joinResult.ok && joinResult.reason === 'ROOM_FULL') {
+          if (joinResult?.type === "error") {
+            logger.warn("Join rejected", {
+              clientId: actualClientId,
+              roomId: msg.roomId,
+              code: joinResult.payload.code,
+            });
+            safeSend(ws, joinResult);
+            break;
+          }
+          if (joinResult?.ok === false) {
             logger.warn("Room is full", { clientId: actualClientId, roomId: msg.roomId });
-            ws.send(JSON.stringify({ type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } }));
+            safeSend(ws, {
+              type: "error",
+              payload: { message: "Room is full", code: joinResult.reason ?? ROOM_FULL },
+            });
             break;
           }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+          touchSession(ctx);
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
+          if (ctx) {
+            ctx.ackedSeq.delete(msg.roomId);
+            ctx.geofence.delete(msg.roomId);
+          }
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          touchSession(ctx);
           break;
         }
         case "reconnect": {
           const clientRooms = rooms.getClientRooms(actualClientId);
           if (!clientRooms.has(msg.roomId)) {
-            ws.send(JSON.stringify({ type: "error", payload: { message: "Must join room before reconnecting" } }));
+            safeSend(ws, {
+              type: "error",
+              payload: { message: "Must join room before reconnecting" },
+            });
             break;
           }
-          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq);
-          ws.send(JSON.stringify(replayResult));
+          if (ctx) ctx.ackedSeq.set(msg.roomId, msg.lastSeq);
+          safeSend(ws, rooms.handleReconnect(msg.roomId, msg.lastSeq));
+          touchSession(ctx);
           break;
         }
         case "location_update": {
@@ -164,15 +600,26 @@ export function createServer({
               payload: { clientId: actualClientId, ...msg.payload },
             }, actualClientId);
           }
+          touchSession(ctx);
           break;
         }
         case "token_refresh": {
           const result = await verifyConnection(msg.token);
           if (result.ok) {
+            const previousClientId = actualClientId;
             actualClientId = result.clientId;
-            ws.send(JSON.stringify({ type: "token_refresh_ok" }));
+            ws._clientId = actualClientId;
+            if (ctx && previousClientId !== actualClientId) {
+              if (liveClients.get(previousClientId) === ctx) liveClients.delete(previousClientId);
+              ctx.clientId = actualClientId;
+              liveClients.set(actualClientId, ctx);
+            }
+            logger.info("Token refreshed", { clientId: actualClientId });
+            safeSend(ws, { type: "token_refresh_ok" });
+            touchSession(ctx);
           } else {
-            ws.send(JSON.stringify({ type: "error", payload: { message: result.error } }));
+            logger.warn("Token refresh failed", { clientId: actualClientId, reason: result.error });
+            safeSend(ws, { type: "error", payload: { message: result.error } });
           }
           break;
         }
@@ -180,6 +627,18 @@ export function createServer({
     });
 
     ws.on("close", (code, reason) => {
+      if (ctx) {
+        // Snapshot before teardown so a pending save cannot persist empty rooms.
+        ctx.frozenState = captureState(ctx);
+        rememberLocal(ctx.clientId, ctx.frozenState);
+        if (liveClients.get(ctx.clientId) === ctx) liveClients.delete(ctx.clientId);
+        sessions.flush(ctx.clientId).catch((err) => {
+          logger.error("Failed to flush session on close", {
+            clientId: ctx.clientId,
+            error: err.message,
+          });
+        });
+      }
       rooms.disconnect(actualClientId);
       rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
@@ -202,25 +661,42 @@ export function createServer({
     ws.on("error", (err) => {
       logger.error("WebSocket error", { clientId: actualClientId, error: err.message });
     });
+
+    if (ctx) {
+      pendingResume = resumeSession(ws, req, url, ctx, token).catch((err) => {
+        logger.error("Session resumption failed", { clientId: ctx.clientId, error: err.message });
+      });
+    }
   });
 
   const interval = setInterval(() => {
+    const now = Date.now();
     wss.clients.forEach((ws) => {
-      if (ws.isAlive === false) {
+      const silentMs = now - (ws._lastPongAt ?? now);
+      if (ws.isAlive === false || silentMs > PONG_TIMEOUT_MS) {
         logger.warn("Terminating zombie connection", {
           clientId: ws._clientId ?? ws._trackedIp ?? "unknown",
         });
         return ws.terminate();
       }
-      ws.isAlive = false;
       ws.ping();
     });
-  }, heartbeatMs ?? 30000);
+  }, HEARTBEAT_MS);
 
   wss.on("close", () => {
     clearInterval(interval);
+    if (ownsSessions) sessions.close();
     server.close();
   });
 
-  return { wss, server, rooms, ipConnectionCount, rateLimiter };
+  return {
+    wss,
+    server,
+    rooms,
+    ipConnectionCount,
+    rateLimiter,
+    sessionManager: sessions,
+    instanceId: resolvedInstanceId,
+    saveAllSessions,
+  };
 }

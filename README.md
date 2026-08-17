@@ -106,6 +106,9 @@ cp .env.example .env
 | `LOG_LEVEL`                | `info`    | Minimum log severity (`debug` \| `info` \| `warn` \| `error`) |
 | `MAX_MESSAGES_PER_SECOND`  | `100`     | Per-client message rate limit (messages per second)    |
 | `CONN_RATE_LIMIT`          | `30`      | Max new connections per IP address per minute          |
+| `SESSION_ENCRYPTION_KEY`   | —         | 32-byte base64 key (or `{"v1":"…"}` key map) that enables session resumption |
+| `SESSION_TTL_MS`           | `3600000` | Sliding TTL of a stored session (ms)                   |
+| `INSTANCE_ID`              | uuid      | Identity published in the `GW_AFFINITY` cookie          |
 
 #### Tuning rate limits for high-traffic deployments
 
@@ -134,6 +137,22 @@ wss://<host>:<port>/?token=<jwt>
 ```
 
 Clients must provide a valid JWT as a query parameter. Connections without a valid token are rejected with a `4001` close code.
+
+### Session Resumption
+
+Set `SESSION_ENCRYPTION_KEY` to enable it; without the key the gateway behaves exactly as before.
+
+The gateway seals each client's session state (rooms, sequence numbers, rate-limit window) with AES-256-GCM. The blob is the `session_id`. On reconnect the client presents it as a URL-encoded query parameter, or as the JWT `sid` claim:
+
+```
+wss://<host>:<port>/?token=<jwt>&session_id=<url-encoded blob>
+```
+
+The gateway restores the rooms and replies with `session_resumed`, carrying each room's saved `highestAckedSeq` / `highestReceivedSeq` plus the room's live `currentSeqPerRoom`. The client then sends the usual `reconnect` message for any room that shows a gap. A blob that fails to decrypt, has expired, or belongs to another identity is ignored and the connection continues as a new session.
+
+Clients that cannot store a blob get the `GW_AFFINITY=<instanceId>` cookie on the handshake response: when they land back on the same instance, the session is restored from that instance's local cache.
+
+A fresh blob also arrives with `server_shutting_down` on graceful shutdown, and with close code `4100` (in the close reason, or a preceding `migrate` frame) after `POST /admin/v1/clients/{clientId}/migrate`. `GET /metrics` reports the `session_resumption_total` counters.
 
 ### HTTP Health Check
 
