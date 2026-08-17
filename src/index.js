@@ -32,8 +32,11 @@ if (isNaN(config.maxPayloadBytes) || config.maxPayloadBytes < 1) {
 }
 
 let wss;
+let httpServer;
+let markShuttingDown;
+let sessionManager;
 try {
-  ({ wss } = createServer(config));
+  ({ wss, httpServer, markShuttingDown, sessionManager } = createServer(config));
 } catch (err) {
   logger.error("Failed to start server", { error: err.message });
   process.exit(1);
@@ -128,8 +131,16 @@ export function shutdown(wss, signal) {
   });
 }
 
-process.on("SIGTERM", () => shutdown(wss, "SIGTERM"));
-process.on("SIGINT", () => shutdown(wss, "SIGINT"));
+process.on("SIGTERM", () => {
+  markShuttingDown();
+  wss.close();
+  shutdown(httpServer, "SIGTERM");
+});
+process.on("SIGINT", () => {
+  markShuttingDown();
+  wss.close();
+  shutdown(httpServer, "SIGINT");
+});
 
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception", { error: err.message });

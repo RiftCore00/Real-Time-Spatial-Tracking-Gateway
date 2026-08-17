@@ -33,18 +33,70 @@ export function createServer({
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "OK" }));
-      return;
-    }
+    const pathname = new URL(req.url, `http://${req.headers.host ?? "localhost"}`).pathname;
 
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not Found" }));
+    if (pathname === "/health" || pathname === "/healthz") {
+      if (isShuttingDown && pathname === "/healthz") {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "shutting down" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (pathname === "/healthz") {
+        res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+      } else {
+        res.end(JSON.stringify({ status: "OK" }));
+      }
+    } else if (pathname === "/readyz") {
+      if (isShuttingDown) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "not ready", reason: "server is shutting down" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "ready",
+        connections: wss.clients.size,
+        rooms: rooms.roomCount,
+      }));
+    } else if (pathname === "/metrics") {
+      const mem = process.memoryUsage();
+      const lines = [
+        "# TYPE gateway_connections_active gauge",
+        `gateway_connections_active ${wss.clients.size}`,
+        "# TYPE gateway_rooms_active gauge",
+        `gateway_rooms_active ${rooms.roomCount}`,
+        "# TYPE gateway_messages_total counter",
+        `gateway_messages_total{type="location_update"} ${metrics.messages.location_update}`,
+        `gateway_messages_total{type="join_room"} ${metrics.messages.join_room}`,
+        `gateway_messages_total{type="leave_room"} ${metrics.messages.leave_room}`,
+        "# TYPE gateway_rate_limit_rejections_total counter",
+        `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
+        "# TYPE gateway_auth_failures_total counter",
+        `gateway_auth_failures_total ${metrics.authFailures}`,
+        "# TYPE session_resumption_total counter",
+        `session_resumption_total{result="success"} ${metrics.sessionResumption.success}`,
+        `session_resumption_total{result="decrypt_failed"} ${metrics.sessionResumption.decrypt_failed}`,
+        `session_resumption_total{result="expired"} ${metrics.sessionResumption.expired}`,
+        `session_resumption_total{result="mismatch"} ${metrics.sessionResumption.mismatch}`,
+        `session_resumption_total{result="new_session"} ${metrics.sessionResumption.new_session}`,
+        "# TYPE gateway_heap_used_bytes gauge",
+        `gateway_heap_used_bytes ${mem.heapUsed}`,
+        "# TYPE gateway_event_loop_lag_ms gauge",
+        `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
+      ];
+      res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+      res.end(lines.join("\n") + "\n");
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not Found" }));
+    }
   });
 
+  httpServer.listen(port ?? 8080);
+
   const wss = new WebSocketServer({
-    server,
+    server: httpServer,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
@@ -73,6 +125,7 @@ export function createServer({
     // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
+      metrics.rateLimitRejections.connection++;
       ws.close(4029, "Connection rate limit exceeded");
       return;
     }
@@ -80,6 +133,7 @@ export function createServer({
     const currentCount = ipConnectionCount.get(ip) ?? 0;
     if (currentCount >= MAX_CONNS_PER_IP) {
       logger.warn("Max connections per IP exceeded", { ip });
+      metrics.rateLimitRejections.connection++;
       ws.close(4029, "Too many connections from this IP");
       return;
     }
@@ -100,6 +154,7 @@ export function createServer({
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
+      metrics.authFailures++;
       ws.close(4001, authResult.error);
       return;
     }
@@ -138,12 +193,45 @@ export function createServer({
           }
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+
+          const currentRooms = rooms.getClientRooms(actualClientId);
+          const roomStates = Array.from(currentRooms).map((roomId) => ({
+            roomId,
+            highestAckedSeq: 0,
+            highestReceivedSeq: 0,
+            geofenceInsideSet: [],
+          }));
+          sessionManager.debouncedSave(actualClientId, {
+            clientId: actualClientId,
+            protocolVersion: 3,
+            authIdentity: authResult,
+            rooms: roomStates,
+            rateLimitState: { messageWindow: [], connectionWindow: [] },
+            metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+          });
           break;
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
+          metrics.messages.leave_room++;
           logger.info("Client left room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+
+          const currentRooms = rooms.getClientRooms(actualClientId);
+          const roomStates = Array.from(currentRooms).map((roomId) => ({
+            roomId,
+            highestAckedSeq: 0,
+            highestReceivedSeq: 0,
+            geofenceInsideSet: [],
+          }));
+          sessionManager.debouncedSave(actualClientId, {
+            clientId: actualClientId,
+            protocolVersion: 3,
+            authIdentity: authResult,
+            rooms: roomStates,
+            rateLimitState: { messageWindow: [], connectionWindow: [] },
+            metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+          });
           break;
         }
         case "reconnect": {
@@ -157,6 +245,7 @@ export function createServer({
           break;
         }
         case "location_update": {
+          metrics.messages.location_update++;
           const roomIds = rooms.getClientRooms(actualClientId);
           for (const roomId of roomIds) {
             rooms.broadcast(roomId, {
@@ -180,6 +269,22 @@ export function createServer({
     });
 
     ws.on("close", (code, reason) => {
+      const currentRooms = rooms.getClientRooms(actualClientId);
+      const roomStates = Array.from(currentRooms).map((roomId) => ({
+        roomId,
+        highestAckedSeq: 0,
+        highestReceivedSeq: 0,
+        geofenceInsideSet: [],
+      }));
+      sessionManager.save(actualClientId, {
+        clientId: actualClientId,
+        protocolVersion: 3,
+        authIdentity: authResult,
+        rooms: roomStates,
+        rateLimitState: { messageWindow: [], connectionWindow: [] },
+        metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
+      }).catch(() => {});
+
       rooms.disconnect(actualClientId);
       rateLimiter.remove(actualClientId);
       const trackedIp = ws._trackedIp;
@@ -204,7 +309,7 @@ export function createServer({
     });
   });
 
-  const interval = setInterval(() => {
+  const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
         logger.warn("Terminating zombie connection", {
@@ -218,8 +323,8 @@ export function createServer({
   }, heartbeatMs ?? 30000);
 
   wss.on("close", () => {
-    clearInterval(interval);
-    server.close();
+    clearInterval(heartbeatInterval);
+    httpServer.close();
   });
 
   return { wss, server, rooms, ipConnectionCount, rateLimiter };
