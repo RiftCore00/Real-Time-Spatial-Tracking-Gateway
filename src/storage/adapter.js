@@ -36,16 +36,54 @@
  * Options for time-range / limit queries.
  *
  * @typedef {object} QueryOptions
- * @property {Date}   [from]  - Start of the time range (inclusive).
- * @property {Date}   [to]    - End of the time range (inclusive).
- * @property {number} [limit] - Maximum number of events to return.
+ * @property {Date}   [from]       - Start of the time range (inclusive).
+ * @property {Date}   [to]         - End of the time range (inclusive).
+ * @property {number} [limit]      - Maximum number of events to return.
+ * @property {string} [resolution] - Data resolution: "raw" | "1m" | "1h" | "1d" | "auto" (default: "auto").
+ */
+
+/**
+ * Resolution tier identifier.
+ * @typedef {"raw"|"1m"|"1h"|"1d"|"auto"} Resolution
+ */
+
+/**
+ * Result of a compaction run.
+ *
+ * @typedef {object} CompactionResult
+ * @property {number} rawDeleted     - Number of raw rows deleted (or partitions dropped).
+ * @property {number} downsample1m   - Number of 1-minute downsample rows written.
+ * @property {number} aggregate1h    - Number of 1-hour aggregate rows written.
+ * @property {number} aggregate1d    - Number of 1-day aggregate rows written.
+ * @property {number} durationMs     - Total compaction duration in milliseconds.
+ * @property {string} [error]        - Error message if compaction partially failed.
+ */
+
+/**
+ * Status of a single retention tier.
+ *
+ * @typedef {object} TierStatus
+ * @property {string}   name     - Tier name: "raw", "1m", "1h", "1d".
+ * @property {number}   rows     - Approximate row count.
+ * @property {number}   sizeBytes- Approximate storage size in bytes.
+ * @property {string|null} oldest- ISO 8601 timestamp of the oldest row, or null.
+ * @property {string|null} newest- ISO 8601 timestamp of the newest row, or null.
+ */
+
+/**
+ * Compaction subsystem status.
+ *
+ * @typedef {object} CompactionStatus
+ * @property {string|null}  lastRun  - ISO 8601 timestamp of the last completed compaction run.
+ * @property {string|null}  nextRun  - ISO 8601 timestamp of the next scheduled run.
+ * @property {TierStatus[]} tiers    - Per-tier statistics.
  */
 
 /**
  * The StorageAdapter interface.
  *
  * Every concrete adapter (PostgresAdapter, MemoryAdapter, …) must implement
- * all five methods below.  Methods are async — callers must await them or
+ * all methods below.  Methods are async — callers must await them or
  * handle the returned Promise.
  *
  * @typedef {object} StorageAdapter
@@ -57,7 +95,8 @@
  *
  * @property {function(string, QueryOptions=): Promise<LocationEvent[]>} queryRoom
  *   Retrieve historical location events for a given room, optionally filtered
- *   by time range and capped to a maximum result count.
+ *   by time range, capped to a maximum result count, and resolved to a specific
+ *   data tier via the resolution parameter.
  *
  * @property {function(SpatialBounds, {limit?: number}=): Promise<LocationEvent[]>} querySpatial
  *   Return events whose coordinates fall within the supplied bounding box.
@@ -71,6 +110,15 @@
  * @property {function(): Promise<void>} close
  *   Release all resources held by the adapter (connections, timers, …).
  *   Must be idempotent — calling it multiple times must not throw.
+ *
+ * @property {function(object=): Promise<CompactionResult>} compact
+ *   Run the compaction pipeline: drop expired raw partitions, compute
+ *   1-minute downsamples, compute 1-hour aggregates, compute 1-day rollups.
+ *   Accepts optional retention overrides. Returns a summary of work done.
+ *
+ * @property {function(): Promise<CompactionStatus>} getCompactionStatus
+ *   Return current compaction status including last/next run times and
+ *   per-tier statistics (row count, size, time range).
  */
 
 /**
@@ -82,7 +130,7 @@
  * @throws {TypeError} When one or more required methods are absent.
  */
 export function assertStorageAdapter(adapter) {
-  const required = ["writeBatch", "queryRoom", "querySpatial", "getLatest", "close"];
+  const required = ["writeBatch", "queryRoom", "querySpatial", "getLatest", "close", "compact", "getCompactionStatus"];
   const missing = required.filter((m) => typeof adapter[m] !== "function");
   if (missing.length > 0) {
     throw new TypeError(
