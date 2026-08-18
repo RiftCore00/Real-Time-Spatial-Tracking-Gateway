@@ -34,9 +34,8 @@ if (isNaN(config.maxPayloadBytes) || config.maxPayloadBytes < 1) {
 let wss;
 let httpServer;
 let markShuttingDown;
-let sessionManager;
 try {
-  ({ wss, httpServer, markShuttingDown, sessionManager } = createServer(config));
+  ({ wss, httpServer, markShuttingDown } = createServer(config));
 } catch (err) {
   logger.error("Failed to start server", { error: err.message });
   process.exit(1);
