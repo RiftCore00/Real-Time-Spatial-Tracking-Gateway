@@ -10,10 +10,21 @@ services:
       WS_HEARTBEAT_MS: "30000"
       MAX_PAYLOAD_BYTES: "1024"
       LOG_LEVEL: "info"
+      STORAGE_ADAPTER: "postgres"
+      DATABASE_URL: "postgresql://tracker:devpassword@postgres:5432/spatial_tracking"
+      STORAGE_RAW_RETENTION_DAYS: "7"
+      STORAGE_1M_RETENTION_DAYS: "90"
+      STORAGE_1H_RETENTION_DAYS: "365"
+      STORAGE_1D_RETENTION_DAYS: "2555"
+      STORAGE_COMPACTION_INTERVAL_MS: "300000"
+      STORAGE_COMPACTION_BATCH_SIZE: "10000"
+      TIMESCALEDB_ENABLED: "false"
+    depends_on:
+      - postgres
     restart: unless-stopped
 
   postgres:
-    image: postgres:16-alpine
+    image: timescale/timescaledb:latest-pg16
     environment:
       POSTGRES_DB: spatial_tracking
       POSTGRES_USER: tracker
