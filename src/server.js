@@ -20,6 +20,7 @@ const MAX_CLOSE_REASON_BYTES = 123;
 const MIGRATE_CLOSE_CODE = 4100;
 const MIGRATE_PATH = /^\/admin\/v1\/clients\/([^/]+)\/migrate$/;
 const PROTOCOL_VERSION = 1;
+const LAG_SAMPLE_MS = 5000;
 
 /**
  * Reads one cookie out of a raw `Cookie` header.
@@ -58,7 +59,8 @@ function sessionIdFromToken(token) {
 }
 
 /**
- * Creates the HTTP health endpoint and the WebSocket gateway on top of it.
+ * Creates the co-located HTTP server (health checks, Prometheus metrics,
+ * admin migration) and the WebSocket gateway on the same port.
  *
  * Session resumption is opt-in: it activates when `sessionManager` is injected
  * or when an encryption key is available, and stays completely inert otherwise.
@@ -81,7 +83,7 @@ function sessionIdFromToken(token) {
  * @param {string} [options.instanceId] - Value published in the `GW_AFFINITY` cookie.
  *   Falls back to `INSTANCE_ID`, then a uuid.
  * @param {object} [options.redis] - node-redis v4 style client handed to a self-built manager.
- * @returns {{ wss: WebSocketServer, server: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
+ * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
  */
 export function createServer({
   port,
@@ -119,25 +121,60 @@ export function createServer({
   /** @type {Map<string, object>} clientId → last known state, for the sticky-cookie path */
   const localSessions = new Map();
 
-  const server = http.createServer((req, res) => {
+  const metrics = {
+    messages: { location_update: 0, join_room: 0, leave_room: 0 },
+    authFailures: 0,
+    rateLimitRejections: { connection: 0 },
+    eventLoopLagMs: 0,
+  };
+
+  let isReady = false;
+  let isShuttingDown = false;
+
+  /** Renders the Prometheus exposition body, folding in session counters when active. */
+  function renderMetrics() {
+    const mem = process.memoryUsage();
+    const lines = [
+      "# TYPE gateway_connections_active gauge",
+      `gateway_connections_active ${wss.clients.size}`,
+      "# TYPE gateway_rooms_active gauge",
+      `gateway_rooms_active ${rooms.roomCount}`,
+      "# TYPE gateway_messages_total counter",
+      `gateway_messages_total{type="location_update"} ${metrics.messages.location_update}`,
+      `gateway_messages_total{type="join_room"} ${metrics.messages.join_room}`,
+      `gateway_messages_total{type="leave_room"} ${metrics.messages.leave_room}`,
+      "# TYPE gateway_rate_limit_rejections_total counter",
+      `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
+      "# TYPE gateway_auth_failures_total counter",
+      `gateway_auth_failures_total ${metrics.authFailures}`,
+    ];
+    if (sessions) {
+      const sessionMetrics = sessions.metrics;
+      lines.push("# TYPE session_resumption_total counter");
+      for (const [result, count] of Object.entries(sessionMetrics.session_resumption_total)) {
+        lines.push(`session_resumption_total{result="${result}"} ${count}`);
+      }
+      lines.push(
+        "# TYPE session_state_size_bytes gauge",
+        `session_state_size_bytes ${sessionMetrics.session_state_size_bytes}`
+      );
+    }
+    lines.push(
+      "# TYPE gateway_heap_used_bytes gauge",
+      `gateway_heap_used_bytes ${mem.heapUsed}`,
+      "# TYPE gateway_event_loop_lag_ms gauge",
+      `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`
+    );
+    return lines.join("\n") + "\n";
+  }
+
+  const httpServer = http.createServer((req, res) => {
     let url;
     try {
       url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     } catch {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Bad Request" }));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "OK" }));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/metrics" && sessions) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(sessions.metrics));
       return;
     }
 
@@ -161,16 +198,67 @@ export function createServer({
       return;
     }
 
+    if (req.method !== "GET") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Method Not Allowed" }));
+      return;
+    }
+
+    if (url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "OK" }));
+      return;
+    }
+
+    if (url.pathname === "/healthz") {
+      if (isShuttingDown) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "shutting down" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+      return;
+    }
+
+    if (url.pathname === "/readyz") {
+      if (isShuttingDown) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "not ready", reason: "server is shutting down" }));
+        return;
+      }
+      if (!isReady) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "not ready", reason: "initializing" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ready",
+          connections: wss.clients.size,
+          rooms: rooms.roomCount,
+        })
+      );
+      return;
+    }
+
+    if (url.pathname === "/metrics") {
+      res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+      res.end(renderMetrics());
+      return;
+    }
+
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not Found" }));
   });
 
   const wss = new WebSocketServer({
-    server,
+    server: httpServer,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
-  server.listen(port ?? 8080);
+  httpServer.listen(port ?? 8080);
 
   const rooms = new RoomManager({
     maxRoomSize: Number(process.env.MAX_ROOM_SIZE) || 500,
@@ -474,6 +562,7 @@ export function createServer({
     // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
+      metrics.rateLimitRejections.connection++;
       ws.close(4029, "Connection rate limit exceeded");
       return;
     }
@@ -481,6 +570,7 @@ export function createServer({
     const currentCount = ipConnectionCount.get(ip) ?? 0;
     if (currentCount >= MAX_CONNS_PER_IP) {
       logger.warn("Max connections per IP exceeded", { ip });
+      metrics.rateLimitRejections.connection++;
       ws.close(4029, "Too many connections from this IP");
       return;
     }
@@ -501,6 +591,7 @@ export function createServer({
 
     if (!authResult.ok) {
       logger.warn("Authentication failed", { clientId, reason: authResult.error });
+      metrics.authFailures++;
       ws.close(4001, authResult.error);
       return;
     }
@@ -562,6 +653,7 @@ export function createServer({
             });
             break;
           }
+          metrics.messages.join_room++;
           logger.info("Client joined room", { clientId: actualClientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
           touchSession(ctx);
@@ -569,6 +661,7 @@ export function createServer({
         }
         case "leave_room": {
           rooms.leave(actualClientId, msg.roomId);
+          metrics.messages.leave_room++;
           if (ctx) {
             ctx.ackedSeq.delete(msg.roomId);
             ctx.geofence.delete(msg.roomId);
@@ -593,6 +686,7 @@ export function createServer({
           break;
         }
         case "location_update": {
+          metrics.messages.location_update++;
           const roomIds = rooms.getClientRooms(actualClientId);
           for (const roomId of roomIds) {
             rooms.broadcast(roomId, {
@@ -669,7 +763,7 @@ export function createServer({
     }
   });
 
-  const interval = setInterval(() => {
+  const heartbeatInterval = setInterval(() => {
     const now = Date.now();
     wss.clients.forEach((ws) => {
       const silentMs = now - (ws._lastPongAt ?? now);
@@ -683,18 +777,40 @@ export function createServer({
     });
   }, HEARTBEAT_MS);
 
+  // Sampled event-loop lag: a zero-delay timer that fires late measures how
+  // far behind the loop is running.
+  function measureLag() {
+    const start = Date.now();
+    setTimeout(() => {
+      metrics.eventLoopLagMs = Date.now() - start;
+    }, 0);
+  }
+  const lagInterval = setInterval(measureLag, LAG_SAMPLE_MS);
+  measureLag();
+
+  function markShuttingDown() {
+    isShuttingDown = true;
+    isReady = false;
+  }
+
   wss.on("close", () => {
-    clearInterval(interval);
+    clearInterval(heartbeatInterval);
+    clearInterval(lagInterval);
     if (ownsSessions) sessions.close();
-    server.close();
+    httpServer.close();
   });
+
+  isReady = true;
 
   return {
     wss,
-    server,
+    server: httpServer,
+    httpServer,
     rooms,
     ipConnectionCount,
     rateLimiter,
+    metrics,
+    markShuttingDown,
     sessionManager: sessions,
     instanceId: resolvedInstanceId,
     saveAllSessions,

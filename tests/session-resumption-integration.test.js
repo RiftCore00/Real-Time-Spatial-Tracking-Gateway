@@ -488,19 +488,24 @@ describe("session resumption (integration)", () => {
 
     const res = await fetch(`http://localhost:${gateway.port}/metrics`);
     expect(res.status).toBe(200);
-    const metrics = await res.json();
-    expect(metrics.session_resumption_total.new_session).toBe(1);
-    expect(metrics.session_resumption_total.success).toBe(1);
-    expect(metrics.session_resumption_total.mismatch).toBe(0);
-    expect(metrics.session_state_size_bytes).toBeGreaterThan(0);
+    expect(res.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
+    const body = await res.text();
+    expect(body).toContain('session_resumption_total{result="new_session"} 1');
+    expect(body).toContain('session_resumption_total{result="success"} 1');
+    expect(body).toContain('session_resumption_total{result="mismatch"} 0');
+    const sizeMatch = body.match(/session_state_size_bytes (\d+)/);
+    expect(sizeMatch).not.toBeNull();
+    expect(parseInt(sizeMatch[1], 10)).toBeGreaterThan(0);
   });
 
-  it("keeps /metrics a 404 when resumption is disabled", async () => {
+  it("omits session counters from /metrics when resumption is disabled", async () => {
     const gateway = startGateway({ withSessions: false });
     expect(gateway.server.sessionManager).toBeNull();
 
     const res = await fetch(`http://localhost:${gateway.port}/metrics`);
-    expect(res.status).toBe(404);
-    expect(await res.json()).toEqual({ error: "Not Found" });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("gateway_connections_active");
+    expect(body).not.toContain("session_resumption_total");
   });
 });

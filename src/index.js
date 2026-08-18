@@ -51,11 +51,12 @@ if (config.sessionTtlMs !== undefined && (isNaN(config.sessionTtlMs) || config.s
 }
 
 let wss;
+let markShuttingDown;
 let sessionManager;
 let instanceId;
 let saveAllSessions;
 try {
-  ({ wss, sessionManager, instanceId, saveAllSessions } = createServer(config));
+  ({ wss, markShuttingDown, sessionManager, instanceId, saveAllSessions } = createServer(config));
 } catch (err) {
   logger.error("Failed to start server", { error: err.message });
   process.exit(1);
@@ -190,8 +191,17 @@ export function shutdown(wss, signal, { saveAllSessions } = {}) {
 // broadcast path stays in use.
 const shutdownOptions = sessionManager ? { saveAllSessions } : {};
 
-process.on("SIGTERM", () => shutdown(wss, "SIGTERM", shutdownOptions));
-process.on("SIGINT", () => shutdown(wss, "SIGINT", shutdownOptions));
+// Flip /healthz and /readyz to 503 first so load balancers stop routing here
+// while the drain phases run; closing the WebSocket server also closes the
+// co-located HTTP server.
+process.on("SIGTERM", () => {
+  markShuttingDown();
+  shutdown(wss, "SIGTERM", shutdownOptions);
+});
+process.on("SIGINT", () => {
+  markShuttingDown();
+  shutdown(wss, "SIGINT", shutdownOptions);
+});
 
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception", { error: err.message });
