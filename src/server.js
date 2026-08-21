@@ -177,7 +177,7 @@ export function createServer({
   });
 
   const wss = new WebSocketServer({
-    server: httpServer,
+    server,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
@@ -487,7 +487,7 @@ export function createServer({
     }
   }
 
-  wss.on("connection", (ws, req) => {
+  wss.on("connection", async (ws, req) => {
     const clientId = uuid();
     ws.isAlive = true;
     ws._lastPongAt = Date.now();
