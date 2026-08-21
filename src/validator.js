@@ -22,6 +22,22 @@ const leaveRoomSchema = z.object({
 const reconnectSchema = z.object({
   roomId: z.string().min(1).max(128),
   lastSeq: z.number().min(0),
+  highestAckedSeq: z.number().min(0).optional(),
+});
+
+const ackSchema = z.object({
+  roomId: z.string().min(1).max(128),
+  seq: z.number().min(0),
+});
+
+const nackSchema = z.object({
+  roomId: z.string().min(1).max(128),
+  seq: z.number().min(0),
+  reason: z.string().max(256).optional(),
+});
+
+const tokenRefreshSchema = z.object({
+  token: z.string().min(1),
 });
 
 const tokenRefreshSchema = z.object({
@@ -46,6 +62,14 @@ const messageSchema = z.discriminatedUnion("type", [
     ...reconnectSchema.shape,
   }),
   z.object({
+    type: z.literal("ack"),
+    ...ackSchema.shape,
+  }),
+  z.object({
+    type: z.literal("nack"),
+    ...nackSchema.shape,
+  }),
+  z.object({
     type: z.literal("token_refresh"),
     ...tokenRefreshSchema.shape,
   }),
@@ -56,6 +80,9 @@ const MESSAGE_SIZE_LIMITS = {
   join_room: 256,
   leave_room: 256,
   reconnect: 256,
+  ack: 256,
+  nack: 512,
+  token_refresh: 2048,
 };
 
 export function validateMessage(raw) {
