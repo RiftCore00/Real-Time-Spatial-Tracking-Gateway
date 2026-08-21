@@ -40,10 +40,6 @@ const tokenRefreshSchema = z.object({
   token: z.string().min(1),
 });
 
-const tokenRefreshSchema = z.object({
-  token: z.string().min(1),
-});
-
 const messageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("location_update"),
