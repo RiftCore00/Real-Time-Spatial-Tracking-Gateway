@@ -83,3 +83,5 @@ export function createRateLimiter(maxPerSecond) {
     get size() {
       return windows.size;
     },
+  };
+}

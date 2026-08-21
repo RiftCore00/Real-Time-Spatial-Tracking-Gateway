@@ -1,6 +1,11 @@
 import { WebSocket } from "ws";
 import { v7 as uuidv7 } from "uuid";
 
+const DEFAULT_RING_BUFFER_SIZE = 100;
+const DEFAULT_MAX_BUFFER_BYTES = 1024 * 1024;
+const DEFAULT_DEDUP_WINDOW_MS = 5000;
+const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
+
 /**
  * @typedef {Object} BackpressureOptions
  * @property {boolean} [enabled=false] - Enable backpressure-aware broadcasting
@@ -195,6 +200,19 @@ export class RoomManager {
     return false;
   }
 
+  /**
+   * Subscribes a client to a room, enforcing the configured DoS limits.
+   *
+   * Re-joining a room the client already occupies only replaces the stored
+   * socket, so it is never rejected by a limit.
+   *
+   * @param {string} clientId - Unique identifier for the client.
+   * @param {string} roomId - Identifier of the room to join.
+   * @param {import("ws").WebSocket} ws - Socket to register for broadcasts.
+   * @returns {undefined | { ok: boolean, reason?: string } | { type: "error", payload: { code: string, message: string } }}
+   *   `{ ok }` when `maxRoomSize` is configured, an error frame when a limit or the
+   *   circuit breaker rejects the join, otherwise `undefined`.
+   */
   join(clientId, roomId, ws) {
     if (clientId == null) throw new TypeError("clientId is required");
     if (roomId == null) throw new TypeError("roomId is required");
