@@ -1,4 +1,10 @@
 import { WebSocket } from "ws";
+import { v7 as uuidv7 } from "uuid";
+
+const DEFAULT_RING_BUFFER_SIZE = 100;
+const DEFAULT_MAX_BUFFER_BYTES = 1024 * 1024;
+const DEFAULT_DEDUP_WINDOW_MS = 5000;
+const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
 
 /**
  * @typedef {Object} BackpressureOptions
@@ -16,17 +22,56 @@ import { WebSocket } from "ws";
  * (`_clientRooms`) enables O(1) lookup of all rooms a client belongs to,
  * which is used during disconnection cleanup.
  *
- * When backpressure options are provided, broadcast() operates in a
- * non-blocking batched mode with per-client slow consumer detection,
- * message coalescing, and automatic eviction.
+ * Supports exactly-once delivery semantics via client acknowledgments,
+ * server-side messageId tracking, and flow control with ACK windows.
  */
 export class RoomManager {
-  constructor({ maxRoomSize = Infinity } = {}) {
+  constructor({
+    maxRoomSize = Infinity,
+    maxRoomsPerClient = Infinity,
+    maxMembersPerRoom = Infinity,
+    maxRooms = Infinity,
+    ringBufferSize = 1000,
+    maxBufferBytes = 10 * 1024 * 1024,
+    deduplicationWindowMs = 5000,
+    maxDedupEntries = 10000,
+    enabled = false,
+    highWaterMark = 1048576,
+    slowConsumerTimeout = 30000,
+    batchSize = 100,
+    circuitBreaker = { enabled: false, memoryThresholdBytes: 500 * 1024 * 1024, recoveryThresholdBytes: 300 * 1024 * 1024 },
+    ackWindowSize = Infinity,
+  } = {}) {
     /** @type {Map<string, Map<string, import("ws").WebSocket>>} */
     this._rooms = new Map();
     /** @type {Map<string, Set<string>>} */
     this._clientRooms = new Map();
     this._maxRoomSize = maxRoomSize;
+    this._maxRoomsPerClient = maxRoomsPerClient;
+    this._maxMembersPerRoom = maxMembersPerRoom;
+    this._maxRooms = maxRooms;
+    /** @type {Map<string, number>} */
+    this._roomSeq = new Map();
+    /** @type {Map<string, Array<{seq: number, messageId: string, payload: any, timestamp: number}>>} */
+    this._roomBuffers = new Map();
+    /** @type {Map<string, number>} */
+    this._roomBufferBytes = new Map();
+    /** @type {Map<string, number>} */
+    this._dedupCache = new Map();
+    this._maxDedupEntries = maxDedupEntries;
+    this._deduplicationWindowMs = deduplicationWindowMs;
+    this._ringBufferSize = ringBufferSize;
+    this._maxBufferBytes = maxBufferBytes;
+    this._backpressureOptions = { enabled, highWaterMark, slowConsumerTimeout, batchSize };
+    /** @type {Map<string, {ws: import("ws").WebSocket, slowSince: number|null, coalescedMessage: any, _timeoutId: any}>} */
+    this._clientState = new Map();
+    this._totalMembers = 0;
+    this._circuitBreakerState = "CLOSED";
+    this._circuitBreakerConfig = circuitBreaker;
+    this._ackWindowSize = ackWindowSize;
+    /** @type {Map<string, Map<string, {highestAckedSeq: number, unackedCount: number, paused: boolean}>>} */
+    this._ackState = new Map();
+    this._useNewJoinFormat = (maxRoomsPerClient !== Infinity) || (maxMembersPerRoom !== Infinity) || (maxRooms !== Infinity) || circuitBreaker.enabled;
   }
 
   /** @private */
@@ -74,6 +119,54 @@ export class RoomManager {
   }
 
   /** @private */
+  _cleanupClientState(clientId) {
+    const state = this._clientState.get(clientId);
+    if (state) {
+      if (state._timeoutId) {
+        clearTimeout(state._timeoutId);
+      }
+      this._clientState.delete(clientId);
+    }
+  }
+
+  /** @private */
+  _cleanupAckState(clientId) {
+    this._ackState.delete(clientId);
+  }
+
+  /** @private */
+  _checkCircuitBreaker() {
+    const config = this._circuitBreakerConfig;
+    if (!config.enabled) return;
+
+    const { heapUsed } = process.memoryUsage();
+
+    if (this._circuitBreakerState === "CLOSED" && heapUsed >= config.memoryThresholdBytes) {
+      this._circuitBreakerState = "OPEN";
+    } else if (this._circuitBreakerState === "OPEN" && heapUsed <= config.recoveryThresholdBytes) {
+      this._circuitBreakerState = "CLOSED";
+    }
+  }
+
+  /**
+   * Returns or initializes the ACK tracking state for a client in a room.
+   * @private
+   */
+  _getAckState(clientId, roomId) {
+    let clientAck = this._ackState.get(clientId);
+    if (!clientAck) {
+      clientAck = new Map();
+      this._ackState.set(clientId, clientAck);
+    }
+    let ackState = clientAck.get(roomId);
+    if (!ackState) {
+      ackState = { highestAckedSeq: 0, unackedCount: 0, paused: false };
+      clientAck.set(roomId, ackState);
+    }
+    return ackState;
+  }
+
+  /** @private */
   _isDuplicate(roomId, message, excludeClientId) {
     let parsed = message;
     if (typeof message === "string") {
@@ -107,18 +200,114 @@ export class RoomManager {
     return false;
   }
 
+  /**
+   * Subscribes a client to a room, enforcing the configured DoS limits.
+   *
+   * Re-joining a room the client already occupies only replaces the stored
+   * socket, so it is never rejected by a limit.
+   *
+   * @param {string} clientId - Unique identifier for the client.
+   * @param {string} roomId - Identifier of the room to join.
+   * @param {import("ws").WebSocket} ws - Socket to register for broadcasts.
+   * @returns {undefined | { ok: boolean, reason?: string } | { type: "error", payload: { code: string, message: string } }}
+   *   `{ ok }` when `maxRoomSize` is configured, an error frame when a limit or the
+   *   circuit breaker rejects the join, otherwise `undefined`.
+   */
   join(clientId, roomId, ws) {
     if (clientId == null) throw new TypeError("clientId is required");
     if (roomId == null) throw new TypeError("roomId is required");
     if (ws == null) throw new TypeError("ws is required");
 
+    if (this._circuitBreakerConfig.enabled) {
+      this._checkCircuitBreaker();
+      if (this._circuitBreakerState === "OPEN") {
+        return {
+          type: "error",
+          payload: {
+            code: "CIRCUIT_BREAKER_OPEN",
+            message: "Circuit breaker is open due to high resource pressure",
+          },
+        };
+      }
+    }
+
+    if (this._maxRoomsPerClient !== Infinity) {
+      const clientRooms = this._clientRooms.get(clientId);
+      const isRejoin = clientRooms && clientRooms.has(roomId);
+      if (!isRejoin) {
+        const currentCount = clientRooms ? clientRooms.size : 0;
+        if (currentCount >= this._maxRoomsPerClient) {
+          return {
+            type: "error",
+            payload: {
+              code: "ROOM_LIMIT_EXCEEDED",
+              message: `Client room limit exceeded (${this._maxRoomsPerClient})`,
+            },
+          };
+        }
+      }
+    }
+
+    if (this._maxMembersPerRoom !== Infinity) {
+      const existingRoom = this._rooms.get(roomId);
+      const isRejoin = existingRoom && existingRoom.has(clientId);
+      if (!isRejoin) {
+        const currentSize = existingRoom ? existingRoom.size : 0;
+        if (currentSize >= this._maxMembersPerRoom) {
+          return {
+            type: "error",
+            payload: {
+              code: "ROOM_FULL",
+              message: `Room member limit reached (${this._maxMembersPerRoom})`,
+            },
+          };
+        }
+      }
+    }
+
+    if (this._maxRooms !== Infinity) {
+      if (!this._rooms.has(roomId)) {
+        if (this._rooms.size >= this._maxRooms) {
+          return {
+            type: "error",
+            payload: {
+              code: "MAX_ROOMS_REACHED",
+              message: `Maximum room count ceiling reached (${this._maxRooms})`,
+            },
+          };
+        }
+      }
+    }
+
     const room = this._ensureRoom(roomId);
     if (!room.has(clientId) && room.size >= this._maxRoomSize) {
+      if (this._useNewJoinFormat) {
+        return {
+          type: "error",
+          payload: {
+            code: "ROOM_FULL",
+            message: `Room member limit reached (${this._maxRoomSize})`,
+          },
+        };
+      }
       return { ok: false, reason: 'ROOM_FULL' };
     }
 
+    const isNewMembership = !room.has(clientId);
     room.set(clientId, ws);
     this._ensureClientRooms(clientId).add(roomId);
+
+    if (isNewMembership) {
+      this._totalMembers++;
+    }
+
+    if (this._backpressureOptions.enabled) {
+      this._ensureClientState(clientId, ws);
+    }
+
+    if (this._useNewJoinFormat) {
+      return;
+    }
     return { ok: true };
   }
 
@@ -154,11 +343,22 @@ export class RoomManager {
         this._cleanupClientState(clientId);
       }
     }
+
+    if (this._ackWindowSize !== Infinity) {
+      const clientAck = this._ackState.get(clientId);
+      if (clientAck) {
+        clientAck.delete(roomId);
+        if (clientAck.size === 0) {
+          this._ackState.delete(clientId);
+        }
+      }
+    }
   }
 
   /**
    * Broadcasts a message to every open connection in a room, optionally
-   * excluding the sender. Stores message in ring buffer with a sequence number.
+   * excluding the sender. Stores message in ring buffer with a sequence number
+   * and a UUID v7 messageId for exactly-once delivery tracking.
    *
    * Objects are serialised to JSON; strings are sent as-is.
    * Clients whose `readyState` is not `OPEN` are silently skipped.
@@ -186,8 +386,11 @@ export class RoomManager {
       }
     }
 
+    const msgId = uuidv7();
+
     const entry = {
       seq: currentSeq,
+      messageId: msgId,
       payload,
       timestamp: Date.now(),
     };
@@ -212,13 +415,22 @@ export class RoomManager {
     const room = this._rooms.get(roomId);
     if (!room) return;
 
+    const wireData = typeof message === "string" ? message : JSON.stringify(message);
+
     if (!this._backpressureOptions.enabled) {
-      const data = typeof message === "string" ? message : JSON.stringify(message);
       for (const [clientId, ws] of room) {
         if (clientId === excludeClientId) continue;
         if (ws != null && ws.readyState === WebSocket.OPEN) {
+          if (this._ackWindowSize !== Infinity) {
+            const ackState = this._getAckState(clientId, roomId);
+            if (ackState.paused || ackState.unackedCount >= this._ackWindowSize) {
+              ackState.paused = true;
+              continue;
+            }
+            ackState.unackedCount++;
+          }
           try {
-            ws.send(data);
+            ws.send(wireData);
           } catch {
             // ignore send errors for individual clients
           }
@@ -236,6 +448,8 @@ export class RoomManager {
     const batchSize = this._backpressureOptions.batchSize;
     let index = 0;
 
+    const wireData = typeof message === "string" ? message : JSON.stringify(message);
+
     const processBatch = () => {
       const end = Math.min(index + batchSize, entries.length);
       while (index < end) {
@@ -244,6 +458,15 @@ export class RoomManager {
 
         if (clientId === excludeClientId) continue;
         if (ws == null || ws.readyState !== WebSocket.OPEN) continue;
+
+        if (this._ackWindowSize !== Infinity) {
+          const ackState = this._getAckState(clientId, roomId);
+          if (ackState.paused || ackState.unackedCount >= this._ackWindowSize) {
+            ackState.paused = true;
+            continue;
+          }
+          ackState.unackedCount++;
+        }
 
         const state = this._clientState.get(clientId);
         const bufferedAmount = ws.bufferedAmount || 0;
@@ -261,10 +484,10 @@ export class RoomManager {
               state.coalescedMessage = message;
             }
           } else {
-            this._sendToClient(clientId, ws, message);
+            this._sendToClientRaw(clientId, ws, wireData);
           }
         } else {
-          this._sendToClient(clientId, ws, message);
+          this._sendToClientRaw(clientId, ws, wireData);
         }
       }
 
@@ -299,6 +522,29 @@ export class RoomManager {
       ws.send(data);
     } catch {
       // ignore send errors for individual clients
+    }
+  }
+
+  /** @private */
+  _sendToClientRaw(clientId, ws, data) {
+    try {
+      ws.send(data);
+    } catch {
+      // ignore send errors for individual clients
+    }
+  }
+
+  /** @private */
+  _sendToClientById(clientId, roomId, entry) {
+    const room = this._rooms.get(roomId);
+    if (!room) return;
+    const ws = room.get(clientId);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      ws.send(JSON.stringify(entry));
+    } catch {
+      // ignore send errors
     }
   }
 
@@ -342,7 +588,7 @@ export class RoomManager {
    * Returns the array of stored ring buffer entries for a room in order.
    *
    * @param {string} roomId - Identifier of the room.
-   * @returns {Array<{ seq: number, payload: any, timestamp: number }>}
+   * @returns {Array<{ seq: number, messageId: string, payload: any, timestamp: number }>}
    */
   getRingBuffer(roomId) {
     if (roomId == null) throw new TypeError("roomId is required");
@@ -352,19 +598,23 @@ export class RoomManager {
 
   /**
    * Evaluates a reconnection request against stored room sequence and ring buffer.
+   * Uses highestAckedSeq when provided to implement exactly-once delivery.
    *
    * @param {string} roomId - Identifier of the target room.
    * @param {number} lastSeq - The sequence number last received by the client.
+   * @param {number} [highestAckedSeq] - The highest sequence number the client has acknowledged.
    * @returns {object} Replay payload (type: "replay", "replay_complete", or "replay_gap").
    */
-  handleReconnect(roomId, lastSeq) {
+  handleReconnect(roomId, lastSeq, highestAckedSeq) {
     if (roomId == null) throw new TypeError("roomId is required");
     if (lastSeq == null) throw new TypeError("lastSeq is required");
 
     const currentSeq = this.getRoomSeq(roomId);
     const buffer = this._roomBuffers.get(roomId) ?? [];
 
-    if (lastSeq === currentSeq) {
+    const replayFrom = (highestAckedSeq != null && highestAckedSeq >= 0) ? highestAckedSeq : lastSeq;
+
+    if (replayFrom === currentSeq) {
       return {
         type: "replay_complete",
         roomId,
@@ -373,8 +623,8 @@ export class RoomManager {
 
     if (buffer.length > 0) {
       const oldestSeq = buffer[0].seq;
-      if (lastSeq >= oldestSeq - 1 && lastSeq < currentSeq) {
-        const missed = buffer.filter((entry) => entry.seq > lastSeq);
+      if (replayFrom >= oldestSeq - 1 && replayFrom < currentSeq) {
+        const missed = buffer.filter((entry) => entry.seq > replayFrom);
         return {
           type: "replay",
           roomId,
@@ -391,6 +641,91 @@ export class RoomManager {
       fromSeq: oldestSeq,
       currentSeq,
     };
+  }
+
+  /**
+   * Processes an acknowledgment from a client for a specific sequence number.
+   * Updates the highest ACKed sequence, decrements unacked count, and resumes
+   * delivery if the flow control window has space.
+   *
+   * @param {string} clientId - Unique identifier for the client.
+   * @param {string} roomId - Identifier of the room.
+   * @param {number} seq - The sequence number being acknowledged.
+   */
+  ack(clientId, roomId, seq) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+    if (seq == null) throw new TypeError("seq is required");
+
+    const ackState = this._getAckState(clientId, roomId);
+    if (seq > ackState.highestAckedSeq) {
+      const delta = seq - ackState.highestAckedSeq;
+      ackState.highestAckedSeq = seq;
+      ackState.unackedCount = Math.max(0, ackState.unackedCount - delta);
+    }
+    if (ackState.paused && ackState.unackedCount < this._ackWindowSize) {
+      ackState.paused = false;
+    }
+  }
+
+  /**
+   * Processes a negative acknowledgment from a client. Re-sends the specific
+   * message from the ring buffer to that client only, bypassing flow control.
+   *
+   * @param {string} clientId - Unique identifier for the client.
+   * @param {string} roomId - Identifier of the room.
+   * @param {number} seq - The sequence number of the corrupted message.
+   */
+  nack(clientId, roomId, seq) {
+    if (clientId == null) throw new TypeError("clientId is required");
+    if (roomId == null) throw new TypeError("roomId is required");
+    if (seq == null) throw new TypeError("seq is required");
+
+    const buffer = this._roomBuffers.get(roomId) ?? [];
+    const entry = buffer.find((e) => e.seq === seq);
+    if (entry) {
+      this._sendToClientById(clientId, roomId, entry);
+    }
+  }
+
+  /**
+   * Moves a client's room memberships from one clientId to another.
+   * Used during token refresh when the identity changes.
+   *
+   * @param {string} oldClientId - The previous client identifier.
+   * @param {string} newClientId - The new client identifier.
+   */
+  updateClientId(oldClientId, newClientId) {
+    if (oldClientId == null) throw new TypeError("oldClientId is required");
+    if (newClientId == null) throw new TypeError("newClientId is required");
+    if (oldClientId === newClientId) return;
+
+    const oldRooms = this._clientRooms.get(oldClientId);
+    if (!oldRooms) return;
+
+    const newClientRooms = this._ensureClientRooms(newClientId);
+
+    for (const roomId of oldRooms) {
+      const room = this._rooms.get(roomId);
+      if (room) {
+        const ws = room.get(oldClientId);
+        if (ws) {
+          room.delete(oldClientId);
+          room.set(newClientId, ws);
+        }
+      }
+      newClientRooms.add(roomId);
+    }
+
+    this._clientRooms.delete(oldClientId);
+
+    if (this._backpressureOptions.enabled) {
+      const oldState = this._clientState.get(oldClientId);
+      if (oldState) {
+        this._clientState.set(newClientId, oldState);
+        this._clientState.delete(oldClientId);
+      }
+    }
   }
 
   /**
@@ -419,6 +754,8 @@ export class RoomManager {
     if (this._backpressureOptions.enabled) {
       this._cleanupClientState(clientId);
     }
+
+    this._cleanupAckState(clientId);
   }
 
   /**
