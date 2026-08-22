@@ -10,7 +10,6 @@ import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { VALIDATION_ERROR } from "./errors.js";
-import { SessionManager } from "./session-manager.js";
 
 /**
  * Creates the co-located HTTP server (health checks, Prometheus metrics,
