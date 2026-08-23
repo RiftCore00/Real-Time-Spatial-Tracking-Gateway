@@ -1,11 +1,6 @@
 import { WebSocket } from "ws";
 import { v7 as uuidv7 } from "uuid";
 
-const DEFAULT_RING_BUFFER_SIZE = 100;
-const DEFAULT_MAX_BUFFER_BYTES = 1024 * 1024;
-const DEFAULT_DEDUP_WINDOW_MS = 5000;
-const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
-
 /**
  * @typedef {Object} BackpressureOptions
  * @property {boolean} [enabled=false] - Enable backpressure-aware broadcasting

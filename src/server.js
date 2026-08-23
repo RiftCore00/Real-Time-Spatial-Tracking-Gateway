@@ -1,5 +1,6 @@
 import http from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
+import { URL } from "node:url";
 import { v4 as uuid } from "uuid";
 import jwt from "jsonwebtoken";
 import { RoomManager } from "./room-manager.js";
@@ -10,7 +11,35 @@ import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { VALIDATION_ERROR } from "./errors.js";
-import { SessionManager } from "./session-manager.js";
+
+/** Constants */
+const MIGRATE_PATH = /^\/admin\/v1\/clients\/([^/]+)\/migrate$/;
+const PROTOCOL_VERSION = 3;
+const RATE_WINDOW_MS = 1000;
+const MAX_LOCAL_SESSIONS = 1000;
+const MAX_CLOSE_REASON_BYTES = 1024;
+const MIGRATE_CLOSE_CODE = 4100;
+const AFFINITY_COOKIE = "GW_AFFINITY";
+const AFFINITY_MAX_AGE_S = 86400;
+const LAG_SAMPLE_MS = 5000;
+
+const resolvedInstanceId = process.env.INSTANCE_ID ?? uuid();
+
+function readCookie(header, name) {
+  if (!header) return null;
+  const match = header.match(new RegExp(`(^|;\\s*)${name}=([^;]+)`));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+function sessionIdFromToken(token) {
+  if (!token) return null;
+  try {
+    const decoded = jwt.decode(token);
+    return decoded?.sid ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Creates the co-located HTTP server (health checks, Prometheus metrics,
@@ -40,7 +69,7 @@ import { SessionManager } from "./session-manager.js";
  * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
  */
 export function createServer({
-  port,
+  _port,
   heartbeatMs,
   maxPayloadBytes,
   connRateLimit,
@@ -66,13 +95,25 @@ export function createServer({
     eventLoopLagMs: 0,
   };
 
-  const sessionManager = new SessionManager({
-    encryptionKey: process.env.SESSION_ENCRYPTION_KEY || undefined,
-  });
+  const encryptionKey = process.env.SESSION_ENCRYPTION_KEY;
+  const sessionManager = encryptionKey ? new SessionManager({ encryptionKey }) : null;
 
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
 
+  let isReady = false;
+
+  const sessions = sessionManager;
+  const liveClients = new Map();
+
+  const localSessions = new Map();
+  const sessionTtl = Number(process.env.SESSION_TTL_MS) || 3600000;
+  let ownsSessions = true;
+  let _pendingResume = null;
+
   const httpServer = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://localhost`);
+    const pathname = url.pathname;
+
     if (req.method !== "GET") {
       res.writeHead(405, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Method Not Allowed" }));
@@ -140,33 +181,6 @@ export function createServer({
         rooms: rooms.roomCount,
       }));
     } else if (pathname === "/metrics") {
-      const mem = process.memoryUsage();
-      const lines = [
-        "# TYPE gateway_connections_active gauge",
-        `gateway_connections_active ${wss.clients.size}`,
-        "# TYPE gateway_rooms_active gauge",
-        `gateway_rooms_active ${rooms.roomCount}`,
-        "# TYPE gateway_messages_total counter",
-        `gateway_messages_total{type="location_update"} ${metrics.messages.location_update}`,
-        `gateway_messages_total{type="join_room"} ${metrics.messages.join_room}`,
-        `gateway_messages_total{type="leave_room"} ${metrics.messages.leave_room}`,
-        `gateway_messages_total{type="ack"} ${metrics.messages.ack}`,
-        `gateway_messages_total{type="nack"} ${metrics.messages.nack}`,
-        "# TYPE gateway_rate_limit_rejections_total counter",
-        `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
-        "# TYPE gateway_auth_failures_total counter",
-        `gateway_auth_failures_total ${metrics.authFailures}`,
-        "# TYPE session_resumption_total counter",
-        `session_resumption_total{result="success"} ${metrics.sessionResumption.success}`,
-        `session_resumption_total{result="decrypt_failed"} ${metrics.sessionResumption.decrypt_failed}`,
-        `session_resumption_total{result="expired"} ${metrics.sessionResumption.expired}`,
-        `session_resumption_total{result="mismatch"} ${metrics.sessionResumption.mismatch}`,
-        `session_resumption_total{result="new_session"} ${metrics.sessionResumption.new_session}`,
-        "# TYPE gateway_heap_used_bytes gauge",
-        `gateway_heap_used_bytes ${mem.heapUsed}`,
-        "# TYPE gateway_event_loop_lag_ms gauge",
-        `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
-      ];
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(renderMetrics());
       return;
@@ -177,7 +191,7 @@ export function createServer({
   });
 
   const wss = new WebSocketServer({
-    server,
+    server: httpServer,
     maxPayload: maxPayloadBytes ?? 1024,
   });
 
@@ -229,7 +243,7 @@ export function createServer({
    * @param {import("http").IncomingMessage} req
    * @returns {object}
    */
-  function createContext(clientId, req) {
+  function _createContext(clientId, req) {
     return {
       clientId,
       ip: req.socket.remoteAddress,
@@ -395,14 +409,14 @@ export function createServer({
         return false;
       }
       if (state.clientId !== ctx.clientId) {
-        sessions.recordResumption("mismatch");
+        sessions?.recordResumption("mismatch");
         logger.warn("Session identity mismatch", {
           clientId: ctx.clientId,
           sessionClientId: state.clientId,
         });
         return false;
       }
-      sessions.recordResumption("success");
+      sessions?.recordResumption("success");
       restoreSession(ws, ctx, state);
       return true;
     }
@@ -411,13 +425,13 @@ export function createServer({
     if (affinity === resolvedInstanceId) {
       const cached = readLocal(ctx.clientId);
       if (cached) {
-        sessions.recordResumption("success");
+        sessions?.recordResumption("success");
         restoreSession(ws, ctx, cached);
         return true;
       }
     }
 
-    sessions.recordResumption("new_session");
+    sessions?.recordResumption("new_session");
     return false;
   }
 
@@ -451,7 +465,7 @@ export function createServer({
    *
    * @returns {Promise<Map<string, string>>} clientId → fresh session blob.
    */
-  async function saveAllSessions() {
+  async function _saveAllSessions() {
     /** @type {Map<string, string>} */
     const blobs = new Map();
     if (!sessions) return blobs;
@@ -477,14 +491,35 @@ export function createServer({
     });
   }
 
-  function safeSend(ws, data) {
-    try {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(typeof data === "string" ? data : JSON.stringify(data));
-      }
-    } catch {
-      // ignore send errors
-    }
+  function renderMetrics() {
+    const mem = process.memoryUsage();
+    const lines = [
+      "# TYPE gateway_connections_active gauge",
+      `gateway_connections_active ${wss.clients.size}`,
+      "# TYPE gateway_rooms_active gauge",
+      `gateway_rooms_active ${rooms.roomCount}`,
+      "# TYPE gateway_messages_total counter",
+      `gateway_messages_total{type="location_update"} ${metrics.messages.location_update}`,
+      `gateway_messages_total{type="join_room"} ${metrics.messages.join_room}`,
+      `gateway_messages_total{type="leave_room"} ${metrics.messages.leave_room}`,
+      `gateway_messages_total{type="ack"} ${metrics.messages.ack}`,
+      `gateway_messages_total{type="nack"} ${metrics.messages.nack}`,
+      "# TYPE gateway_rate_limit_rejections_total counter",
+      `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
+      "# TYPE gateway_auth_failures_total counter",
+      `gateway_auth_failures_total ${metrics.authFailures}`,
+      "# TYPE session_resumption_total counter",
+      `session_resumption_total{result="success"} ${metrics.sessionResumption.success}`,
+      `session_resumption_total{result="decrypt_failed"} ${metrics.sessionResumption.decrypt_failed}`,
+      `session_resumption_total{result="expired"} ${metrics.sessionResumption.expired}`,
+      `session_resumption_total{result="mismatch"} ${metrics.sessionResumption.mismatch}`,
+      `session_resumption_total{result="new_session"} ${metrics.sessionResumption.new_session}`,
+      "# TYPE gateway_heap_used_bytes gauge",
+      `gateway_heap_used_bytes ${mem.heapUsed}`,
+      "# TYPE gateway_event_loop_lag_ms gauge",
+      `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
+    ];
+    return lines.join("\n") + "\n";
   }
 
   wss.on("connection", async (ws, req) => {
@@ -522,6 +557,9 @@ export function createServer({
 
     const token = url.searchParams.get("token");
     let authResult;
+    let identity;
+    let ctx;
+
     verifyConnection(token).then((result) => {
       authResult = result;
 
@@ -532,9 +570,12 @@ export function createServer({
         return;
       }
 
-      const identity = { clientId: authResult.clientId ?? clientId };
+      identity = { clientId: authResult.clientId ?? clientId };
       ws._clientId = identity.clientId;
       logger.info("Client connected", { clientId: identity.clientId, ip });
+
+      ctx = _createContext(identity.clientId, req);
+      liveClients.set(identity.clientId, ctx);
 
       ws.on("pong", heartbeat);
 
@@ -572,6 +613,12 @@ export function createServer({
         }).catch(() => {});
       }
       if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
+
+      if (ctx) {
+        _pendingResume = resumeSession(ws, req, url, ctx, token).catch((err) => {
+          logger.error("Session resumption failed", { clientId: ctx.clientId, error: err.message });
+        });
+      }
 
       ws.on("message", (raw) => {
         if (!rateLimiter.check(identity.clientId)) {
@@ -752,12 +799,6 @@ export function createServer({
     }).catch(() => {
       ws.close(4001, "Authentication failed");
     });
-
-    if (ctx) {
-      pendingResume = resumeSession(ws, req, url, ctx, token).catch((err) => {
-        logger.error("Session resumption failed", { clientId: ctx.clientId, error: err.message });
-      });
-    }
   });
 
   const heartbeatInterval = setInterval(() => {
@@ -794,12 +835,36 @@ export function createServer({
     clearInterval(heartbeatInterval);
     clearInterval(lagInterval);
     if (ownsSessions) sessions.close();
-    httpServer.close();
   });
 
-  function markShuttingDown() {
-    isShuttingDown = true;
-  }
+  httpServer.listen(_port);
+
+  // Ensure wss.close() waits for HTTP server to close
+  const originalClose = wss.close.bind(wss);
+  wss.close = function (callback) {
+    // Terminate all connections immediately
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.terminate();
+      }
+    });
+
+    const promise = originalClose();
+    const closeHttpServer = () => new Promise((resolve) => httpServer.close(resolve));
+
+    if (promise && typeof promise.then === "function") {
+      return promise.then(() => closeHttpServer()).then(() => {
+        if (callback) callback();
+      });
+    }
+
+    // Fallback for callback-based close
+    return originalClose(() => {
+      closeHttpServer().then(() => {
+        if (callback) callback();
+      });
+    });
+  };
 
   return { wss, httpServer, rooms, sessionManager, ipConnectionCount, rateLimiter, markShuttingDown };
 }
