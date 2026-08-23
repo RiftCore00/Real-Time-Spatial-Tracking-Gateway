@@ -95,9 +95,8 @@ export function createServer({
     eventLoopLagMs: 0,
   };
 
-  const sessionManager = new SessionManager({
-    encryptionKey: process.env.SESSION_ENCRYPTION_KEY || undefined,
-  });
+  const encryptionKey = process.env.SESSION_ENCRYPTION_KEY;
+  const sessionManager = encryptionKey ? new SessionManager({ encryptionKey }) : null;
 
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
 
@@ -410,14 +409,14 @@ export function createServer({
         return false;
       }
       if (state.clientId !== ctx.clientId) {
-        sessions.recordResumption("mismatch");
+        sessions?.recordResumption("mismatch");
         logger.warn("Session identity mismatch", {
           clientId: ctx.clientId,
           sessionClientId: state.clientId,
         });
         return false;
       }
-      sessions.recordResumption("success");
+      sessions?.recordResumption("success");
       restoreSession(ws, ctx, state);
       return true;
     }
@@ -426,13 +425,13 @@ export function createServer({
     if (affinity === resolvedInstanceId) {
       const cached = readLocal(ctx.clientId);
       if (cached) {
-        sessions.recordResumption("success");
+        sessions?.recordResumption("success");
         restoreSession(ws, ctx, cached);
         return true;
       }
     }
 
-    sessions.recordResumption("new_session");
+    sessions?.recordResumption("new_session");
     return false;
   }
 
@@ -836,8 +835,36 @@ export function createServer({
     clearInterval(heartbeatInterval);
     clearInterval(lagInterval);
     if (ownsSessions) sessions.close();
-    httpServer.close();
   });
+
+  httpServer.listen(_port);
+
+  // Ensure wss.close() waits for HTTP server to close
+  const originalClose = wss.close.bind(wss);
+  wss.close = function (callback) {
+    // Terminate all connections immediately
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.terminate();
+      }
+    });
+
+    const promise = originalClose();
+    const closeHttpServer = () => new Promise((resolve) => httpServer.close(resolve));
+
+    if (promise && typeof promise.then === "function") {
+      return promise.then(() => closeHttpServer()).then(() => {
+        if (callback) callback();
+      });
+    }
+
+    // Fallback for callback-based close
+    return originalClose(() => {
+      closeHttpServer().then(() => {
+        if (callback) callback();
+      });
+    });
+  };
 
   return { wss, httpServer, rooms, sessionManager, ipConnectionCount, rateLimiter, markShuttingDown };
 }
