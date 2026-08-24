@@ -69,6 +69,7 @@ logger.info("Gateway started", {
   maxPayloadBytes: config.maxPayloadBytes,
   instanceId,
   sessionResumption: sessionManager != null,
+  storageAdapter: process.env.DATABASE_URL ? "postgres" : "null",
 });
 
 /**

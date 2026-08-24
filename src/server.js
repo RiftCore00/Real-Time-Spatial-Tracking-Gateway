@@ -11,7 +11,54 @@ import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { VALIDATION_ERROR } from "./errors.js";
-import { PredictiveEngine } from "./predictor.js";
+import { createStorageAdapter } from "./storage.js";
+
+const AFFINITY_COOKIE = "GW_AFFINITY";
+const AFFINITY_MAX_AGE_S = 3600;
+const DEFAULT_SESSION_TTL_MS = 3600000;
+const RATE_WINDOW_MS = 1000;
+const MAX_LOCAL_SESSIONS = 10000;
+const MAX_CLOSE_REASON_BYTES = 123;
+const MIGRATE_CLOSE_CODE = 4100;
+const MIGRATE_PATH = /^\/admin\/v1\/clients\/([^/]+)\/migrate$/;
+const PROTOCOL_VERSION = 1;
+const LAG_SAMPLE_MS = 1000;
+
+/**
+ * Reads one cookie out of a raw `Cookie` header.
+ *
+ * @param {unknown} header - Value of the `Cookie` request header.
+ * @param {string} name - Cookie name to look for.
+ * @returns {string|null} The value, or null when absent.
+ */
+function readCookie(header, name) {
+  if (typeof header !== "string") return null;
+  for (const pair of header.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue;
+    if (pair.slice(0, eq).trim() === name) return pair.slice(eq + 1).trim();
+  }
+  return null;
+}
+
+/**
+ * Reads the `sid` claim of an already-verified token. `auth.js` verified the
+ * signature, so decoding without re-verification is safe here.
+ *
+ * @param {string|null|undefined} token
+ * @returns {string|null} The session blob, or null when the claim is absent.
+ */
+function sessionIdFromToken(token) {
+  if (typeof token !== "string" || token.length === 0) return null;
+  let payload;
+  try {
+    payload = jwt.decode(token);
+  } catch {
+    return null;
+  }
+  const sid = payload && typeof payload === "object" ? payload.sid : null;
+  return typeof sid === "string" && sid.length > 0 ? sid : null;
+}
 
 /**
  * Creates the co-located HTTP server (health checks, Prometheus metrics,
@@ -56,27 +103,54 @@ export function createServer({
   maxDedupEntries: _maxDedupEntries,
   ackWindowSize: _ackWindowSize,
   maxMessagesPerSecond,
+  sessionManager,
+  sessionEncryptionKey,
+  sessionTtlMs,
+  instanceId,
+  redis,
+  storageAdapter,
 } = {}) {
   let isShuttingDown = false;
+  let isReady = true;
 
   const metrics = {
     messages: { location_update: 0, join_room: 0, leave_room: 0, ack: 0, nack: 0 },
     rateLimitRejections: { connection: 0 },
     authFailures: 0,
-    sessionResumption: { success: 0, decrypt_failed: 0, expired: 0, mismatch: 0, new_session: 0 },
     eventLoopLagMs: 0,
   };
 
-  const encryptionKey = process.env.SESSION_ENCRYPTION_KEY || randomBytes(32).toString("base64");
+  const sessionKey = sessionEncryptionKey ?? process.env.SESSION_ENCRYPTION_KEY ?? null;
+  const sessionTtl = sessionTtlMs ?? (Number(process.env.SESSION_TTL_MS) || DEFAULT_SESSION_TTL_MS);
+  const ownsSessions = sessionManager == null && sessionKey != null;
+  /** @type {import("./session-manager.js").SessionManager|null} */
+  const sessions = ownsSessions
+    ? new SessionManager({
+        redis: redis ?? null,
+        encryptionKey: sessionKey,
+        ttlMs: sessionTtl,
+        logger,
+      })
+    : (sessionManager ?? null);
+  const resolvedInstanceId = instanceId ?? process.env.INSTANCE_ID ?? uuid();
 
-  const sessionManager = new SessionManager({ encryptionKey });
+  /** @type {Map<string, object>} clientId → live connection context */
+  const liveClients = new Map();
+  /** @type {Map<string, object>} clientId → last known state, for the sticky-cookie path */
+  const localSessions = new Map();
+
+  const ownsStorage = storageAdapter == null;
+  const storage = storageAdapter ?? createStorageAdapter();
 
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
 
   const httpServer = http.createServer((req, res) => {
-    if (req.method !== "GET") {
-      res.writeHead(405, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Method Not Allowed" }));
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request" }));
       return;
     }
 
@@ -140,7 +214,10 @@ export function createServer({
         connections: wss.clients.size,
         rooms: rooms.roomCount,
       }));
-    } else if (pathname === "/metrics") {
+      return;
+    }
+
+    if (url.pathname === "/metrics") {
       const mem = process.memoryUsage();
       const lines = [
         "# TYPE gateway_connections_active gauge",
@@ -157,19 +234,26 @@ export function createServer({
         `gateway_rate_limit_rejections_total{kind="connection"} ${metrics.rateLimitRejections.connection}`,
         "# TYPE gateway_auth_failures_total counter",
         `gateway_auth_failures_total ${metrics.authFailures}`,
-        "# TYPE session_resumption_total counter",
-        `session_resumption_total{result="success"} ${metrics.sessionResumption.success}`,
-        `session_resumption_total{result="decrypt_failed"} ${metrics.sessionResumption.decrypt_failed}`,
-        `session_resumption_total{result="expired"} ${metrics.sessionResumption.expired}`,
-        `session_resumption_total{result="mismatch"} ${metrics.sessionResumption.mismatch}`,
-        `session_resumption_total{result="new_session"} ${metrics.sessionResumption.new_session}`,
         "# TYPE gateway_heap_used_bytes gauge",
         `gateway_heap_used_bytes ${mem.heapUsed}`,
         "# TYPE gateway_event_loop_lag_ms gauge",
         `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
       ];
+      if (sessions) {
+        const sm = sessions.metrics;
+        lines.push(
+          "# TYPE session_resumption_total counter",
+          `session_resumption_total{result="success"} ${sm.session_resumption_total.success}`,
+          `session_resumption_total{result="decrypt_failed"} ${sm.session_resumption_total.decrypt_failed}`,
+          `session_resumption_total{result="expired"} ${sm.session_resumption_total.expired}`,
+          `session_resumption_total{result="mismatch"} ${sm.session_resumption_total.mismatch}`,
+          `session_resumption_total{result="new_session"} ${sm.session_resumption_total.new_session}`,
+          "# TYPE session_state_size_bytes gauge",
+          `session_state_size_bytes ${sm.session_state_size_bytes}`
+        );
+      }
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
-      res.end(renderMetrics());
+      res.end(lines.join("\n"));
       return;
     }
 
@@ -181,6 +265,8 @@ export function createServer({
     server: httpServer,
     maxPayload: maxPayloadBytes ?? 1024,
   });
+
+  httpServer.listen(port ?? 8080);
 
   const rooms = new RoomManager({
     maxRoomSize: effectiveMaxRoomSize,
@@ -482,16 +568,6 @@ export function createServer({
     });
   }
 
-  function safeSend(ws, data) {
-    try {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(typeof data === "string" ? data : JSON.stringify(data));
-      }
-    } catch {
-      // ignore send errors
-    }
-  }
-
   wss.on("connection", async (ws, req) => {
     const clientId = uuid();
     ws.isAlive = true;
@@ -527,265 +603,202 @@ export function createServer({
 
     const token = url.searchParams.get("token");
     let authResult;
-    verifyConnection(token).then((result) => {
-      authResult = result;
-
-      if (!authResult.ok) {
-        logger.warn("Authentication failed", { clientId, reason: authResult.error });
-        metrics.authFailures++;
-        ws.close(4001, authResult.error);
-        return;
-      }
-
-      const identity = { clientId: authResult.clientId ?? clientId };
-      ws._clientId = identity.clientId;
-      logger.info("Client connected", { clientId: identity.clientId, ip });
-
-      ws.on("pong", heartbeat);
-
-      const sessionId = url.searchParams.get("session_id");
-      if (sessionId) {
-        sessionManager.load(sessionId).then((savedSession) => {
-          if (!savedSession) {
-            metrics.sessionResumption.new_session++;
-            return;
-          }
-          const savedIdentity = savedSession.authIdentity?.sub ?? savedSession.authIdentity?.clientId;
-          if (savedIdentity !== identity.clientId) {
-            metrics.sessionResumption.mismatch++;
-            return;
-          }
-          if (savedSession.rooms && savedSession.rooms.length > 0) {
-            for (const roomState of savedSession.rooms) {
-              rooms.join(identity.clientId, roomState.roomId, ws);
-            }
-            const roomIds = savedSession.rooms.map((r) => r.roomId);
-            metrics.sessionResumption.success++;
-            safeSend(ws, {
-              type: "session_resumed",
-              payload: {
-                sessionId,
-                rooms: roomIds,
-                currentSeqPerRoom: savedSession.rooms.map((r) => ({
-                  roomId: r.roomId,
-                  highestAckedSeq: r.highestAckedSeq,
-                  highestReceivedSeq: r.highestReceivedSeq,
-                })),
-              },
-            });
-          }
-        }).catch(() => {});
-      }
-      if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
-
-      ws.on("message", (raw) => {
-        if (!rateLimiter.check(identity.clientId)) {
-          logger.warn("Message rate limit exceeded", { clientId: identity.clientId });
-          safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
-          return;
-        }
-
-        const validation = validateMessage(raw.toString());
-
-        if (!validation.ok) {
-          logger.warn("Validation failed", { clientId: identity.clientId, error: validation.error });
-          sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
-          return;
-        }
-
-        const msg = validation.data;
-
-        switch (msg.type) {
-          case "join_room": {
-            metrics.messages.join_room++;
-            const joinResult = rooms.join(identity.clientId, msg.roomId, ws);
-            if (joinResult && joinResult.type === "error") {
-              logger.warn("Join rejected", { clientId: identity.clientId, roomId: msg.roomId, code: joinResult.payload.code });
-              safeSend(ws, joinResult);
-              break;
-            }
-            if (joinResult && joinResult.ok === false) {
-              logger.warn("Room is full", { clientId: identity.clientId, roomId: msg.roomId });
-              safeSend(ws, { type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } });
-              break;
-            }
-            logger.info("Client joined room", { clientId: identity.clientId, roomId: msg.roomId });
-            safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
-
-            const currentRooms = rooms.getClientRooms(identity.clientId);
-            const roomStates = Array.from(currentRooms).map((roomId) => ({
-              roomId,
-              highestAckedSeq: 0,
-              highestReceivedSeq: 0,
-              geofenceInsideSet: [],
-            }));
-            sessionManager.debouncedSave(identity.clientId, {
-              clientId: identity.clientId,
-              protocolVersion: 3,
-              authIdentity: authResult,
-              rooms: roomStates,
-              rateLimitState: { messageWindow: [], connectionWindow: [] },
-              metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
-            });
-            break;
-          }
-          case "leave_room": {
-            metrics.messages.leave_room++;
-            rooms.leave(identity.clientId, msg.roomId);
-            logger.info("Client left room", { clientId: identity.clientId, roomId: msg.roomId });
-            safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
-
-            const currentRooms = rooms.getClientRooms(identity.clientId);
-            const roomStates = Array.from(currentRooms).map((roomId) => ({
-              roomId,
-              highestAckedSeq: 0,
-              highestReceivedSeq: 0,
-              geofenceInsideSet: [],
-            }));
-            sessionManager.debouncedSave(identity.clientId, {
-              clientId: identity.clientId,
-              protocolVersion: 3,
-              authIdentity: authResult,
-              rooms: roomStates,
-              rateLimitState: { messageWindow: [], connectionWindow: [] },
-              metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
-            });
-            break;
-          }
-          case "reconnect": {
-            const clientRooms = rooms.getClientRooms(identity.clientId);
-            if (!clientRooms.has(msg.roomId)) {
-              safeSend(ws, { type: "error", payload: { message: "Must join room before reconnecting" } });
-              break;
-            }
-            const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq, msg.highestAckedSeq);
-            safeSend(ws, replayResult);
-            break;
-          }
-          case "ack": {
-            metrics.messages.ack++;
-            rooms.ack(identity.clientId, msg.roomId, msg.seq);
-            break;
-          }
-          case "nack": {
-            metrics.messages.nack++;
-            logger.warn("NACK received", { clientId: identity.clientId, roomId: msg.roomId, seq: msg.seq, reason: msg.reason });
-            rooms.nack(identity.clientId, msg.roomId, msg.seq);
-            break;
-          }
-          case "token_refresh": {
-            try {
-              const decoded = jwt.decode(msg.token, { complete: true });
-              if (!decoded) {
-                safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-                break;
-              }
-              verifyConnection(msg.token).then((refreshResult) => {
-                if (!refreshResult.ok) {
-                  safeSend(ws, { type: "error", payload: { message: refreshResult.error } });
-                  return;
-                }
-                const oldClientId = identity.clientId;
-                const newClientId = refreshResult.clientId;
-                authResult = refreshResult;
-                identity.clientId = newClientId;
-                ws._clientId = newClientId;
-                rooms.updateClientId(oldClientId, newClientId);
-                rateLimiter.remove(oldClientId);
-                safeSend(ws, { type: "token_refresh_ok", payload: { clientId: newClientId } });
-              }).catch(() => {
-                safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-              });
-            } catch {
-              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-            }
-            break;
-          }
-          case "location_update": {
-            metrics.messages.location_update++;
-            const location = {
-              latitude: msg.payload.latitude,
-              longitude: msg.payload.longitude,
-              altitude: msg.payload.altitude,
-              accuracy: msg.payload.accuracy,
-              speed: msg.payload.speed,
-              heading: msg.payload.heading,
-              timestamp: msg.payload.timestamp,
-            };
-            const predictorResult = predictor.update(identity.clientId, location);
-            if (predictorResult.anomalies?.length) {
-              for (const anomaly of predictorResult.anomalies) {
-                const rooms_ = rooms.getClientRooms(identity.clientId);
-                for (const roomId of rooms_) {
-                  rooms.broadcast(roomId, {
-                    type: anomaly.type === "gps_anomaly" ? "gps_anomaly" : "kinematic_anomaly",
-                    payload: { clientId: identity.clientId, ...anomaly },
-                  }, identity.clientId);
-                }
-              }
-            }
-            predictor.checkPreAlerts(identity.clientId);
-            const roomIds = rooms.getClientRooms(identity.clientId);
-            for (const roomId of roomIds) {
-              rooms.broadcast(roomId, {
-                type: "location_update",
-                payload: { clientId: identity.clientId, ...msg.payload },
-              }, identity.clientId);
-            }
-            break;
-          }
-        }
-      });
-
-      ws.on("close", (code, reason) => {
-        const currentRooms = rooms.getClientRooms(identity.clientId);
-        const roomStates = Array.from(currentRooms).map((roomId) => ({
-          roomId,
-          highestAckedSeq: 0,
-          highestReceivedSeq: 0,
-          geofenceInsideSet: [],
-        }));
-        sessionManager.save(identity.clientId, {
-          clientId: identity.clientId,
-          protocolVersion: 3,
-          authIdentity: authResult,
-          rooms: roomStates,
-          rateLimitState: { messageWindow: [], connectionWindow: [] },
-          metadata: { ip, userAgent: req.headers?.["user-agent"] ?? "", connectedAt: Date.now(), lastActivityAt: Date.now() },
-        }).catch(() => {});
-
-        rooms.disconnect(identity.clientId);
-        rateLimiter.remove(identity.clientId);
-        predictor.removeClient(identity.clientId);
-        const trackedIp = ws._trackedIp;
-        if (trackedIp) {
-          const count = ipConnectionCount.get(trackedIp) ?? 1;
-          if (count <= 1) {
-            ipConnectionCount.delete(trackedIp);
-          } else {
-            ipConnectionCount.set(trackedIp, count - 1);
-          }
-          connRateLimiter.cleanup(trackedIp);
-        }
-        logger.info("Client disconnected", {
-          clientId: identity.clientId,
-          code,
-          reason: reason?.toString() ?? "unknown",
-        });
-      });
-
-      ws.on("error", (err) => {
-        logger.error("WebSocket error", { clientId: identity.clientId, error: err.message });
-      });
-    }).catch(() => {
+    try {
+      authResult = await verifyConnection(token);
+    } catch {
       ws.close(4001, "Authentication failed");
-    });
+      return;
+    }
 
+    if (!authResult.ok) {
+      logger.warn("Authentication failed", { clientId, reason: authResult.error });
+      metrics.authFailures++;
+      ws.close(4001, authResult.error);
+      return;
+    }
+
+    const identity = { clientId: authResult.clientId ?? clientId };
+    ws._clientId = identity.clientId;
+    logger.info("Client connected", { clientId: identity.clientId, ip });
+
+    ws.on("pong", heartbeat);
+
+    const ctx = sessions ? createContext(identity.clientId, req) : null;
+    if (ctx) {
+      ctx.ws = ws;
+      liveClients.set(identity.clientId, ctx);
+    }
+    /** @type {Promise<unknown>|null} Frames wait for the handshake so replayed state lands first. */
+    let pendingResume = null;
     if (ctx) {
       pendingResume = resumeSession(ws, req, url, ctx, token).catch((err) => {
         logger.error("Session resumption failed", { clientId: ctx.clientId, error: err.message });
       });
     }
+
+    ws.on("message", async (raw) => {
+      if (pendingResume) {
+        await pendingResume;
+        pendingResume = null;
+      }
+
+      if (!rateLimiter.check(identity.clientId)) {
+        logger.warn("Message rate limit exceeded", { clientId: identity.clientId });
+        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
+        return;
+      }
+      if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
+
+      const validation = validateMessage(raw.toString());
+
+      if (!validation.ok) {
+        logger.warn("Validation failed", { clientId: identity.clientId, error: validation.error });
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
+        return;
+      }
+
+      const msg = validation.data;
+
+      switch (msg.type) {
+        case "join_room": {
+          metrics.messages.join_room++;
+          const joinResult = rooms.join(identity.clientId, msg.roomId, ws);
+          if (joinResult && joinResult.type === "error") {
+            logger.warn("Join rejected", { clientId: identity.clientId, roomId: msg.roomId, code: joinResult.payload.code });
+            safeSend(ws, joinResult);
+            break;
+          }
+          if (joinResult && joinResult.ok === false) {
+            logger.warn("Room is full", { clientId: identity.clientId, roomId: msg.roomId });
+            safeSend(ws, { type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } });
+            break;
+          }
+          logger.info("Client joined room", { clientId: identity.clientId, roomId: msg.roomId });
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+          touchSession(ctx);
+          break;
+        }
+        case "leave_room": {
+          metrics.messages.leave_room++;
+          rooms.leave(identity.clientId, msg.roomId);
+          if (ctx) {
+            ctx.ackedSeq.delete(msg.roomId);
+            ctx.geofence.delete(msg.roomId);
+          }
+          logger.info("Client left room", { clientId: identity.clientId, roomId: msg.roomId });
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          touchSession(ctx);
+          break;
+        }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(identity.clientId);
+          if (!clientRooms.has(msg.roomId)) {
+            safeSend(ws, { type: "error", payload: { message: "Must join room before reconnecting" } });
+            break;
+          }
+          if (ctx) ctx.ackedSeq.set(msg.roomId, msg.lastSeq);
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq, msg.highestAckedSeq);
+          safeSend(ws, replayResult);
+          touchSession(ctx);
+          break;
+        }
+        case "ack": {
+          metrics.messages.ack++;
+          rooms.ack(identity.clientId, msg.roomId, msg.seq);
+          break;
+        }
+        case "nack": {
+          metrics.messages.nack++;
+          logger.warn("NACK received", { clientId: identity.clientId, roomId: msg.roomId, seq: msg.seq, reason: msg.reason });
+          rooms.nack(identity.clientId, msg.roomId, msg.seq);
+          break;
+        }
+        case "token_refresh": {
+          try {
+            const decoded = jwt.decode(msg.token, { complete: true });
+            if (!decoded) {
+              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+              break;
+            }
+            verifyConnection(msg.token).then((refreshResult) => {
+              if (!refreshResult.ok) {
+                safeSend(ws, { type: "error", payload: { message: refreshResult.error } });
+                return;
+              }
+              const oldClientId = identity.clientId;
+              const newClientId = refreshResult.clientId;
+              authResult = refreshResult;
+              identity.clientId = newClientId;
+              ws._clientId = newClientId;
+              rooms.updateClientId(oldClientId, newClientId);
+              rateLimiter.remove(oldClientId);
+              if (ctx && oldClientId !== newClientId) {
+                if (liveClients.get(oldClientId) === ctx) liveClients.delete(oldClientId);
+                ctx.clientId = newClientId;
+                liveClients.set(newClientId, ctx);
+              }
+              safeSend(ws, { type: "token_refresh_ok", payload: { clientId: newClientId } });
+              touchSession(ctx);
+            }).catch(() => {
+              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+            });
+          } catch {
+            safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+          }
+          break;
+        }
+        case "location_update": {
+          metrics.messages.location_update++;
+          const roomIds = rooms.getClientRooms(identity.clientId);
+          for (const roomId of roomIds) {
+            rooms.broadcast(roomId, {
+              type: "location_update",
+              payload: { clientId: identity.clientId, ...msg.payload },
+            }, identity.clientId);
+
+            storage.saveLocation(identity.clientId, roomId, msg.payload).catch((err) => {
+              logger.error("Failed to persist location", { clientId: identity.clientId, roomId, error: err.message });
+            });
+          }
+          touchSession(ctx);
+          break;
+        }
+      }
+    });
+
+    ws.on("close", (code, reason) => {
+      if (ctx) {
+        // Snapshot before teardown so a pending save cannot persist empty rooms.
+        ctx.frozenState = captureState(ctx);
+        rememberLocal(ctx.clientId, ctx.frozenState);
+        if (liveClients.get(ctx.clientId) === ctx) liveClients.delete(ctx.clientId);
+        sessions.flush(ctx.clientId).catch((err) => {
+          logger.error("Failed to flush session on close", { clientId: ctx.clientId, error: err.message });
+        });
+      }
+
+      rooms.disconnect(identity.clientId);
+      rateLimiter.remove(identity.clientId);
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
+        }
+        connRateLimiter.cleanup(trackedIp);
+      }
+      logger.info("Client disconnected", {
+        clientId: identity.clientId,
+        code,
+        reason: reason?.toString() ?? "unknown",
+      });
+    });
+
+    ws.on("error", (err) => {
+      logger.error("WebSocket error", { clientId: identity.clientId, error: err.message });
+    });
   });
 
   const heartbeatInterval = setInterval(() => {
@@ -821,14 +834,24 @@ export function createServer({
   wss.on("close", () => {
     clearInterval(heartbeatInterval);
     clearInterval(lagInterval);
-    if (ownsSessions) sessionManager.close();
-    predictor.close();
+    if (ownsSessions) sessions.close();
+    if (ownsStorage) storage.close().catch((err) => {
+      logger.error("Failed to close storage adapter", { error: err.message });
+    });
     httpServer.close();
   });
 
-  function markShuttingDown() {
-    isShuttingDown = true;
-  }
-
-  return { wss, httpServer, rooms, sessionManager, ipConnectionCount, rateLimiter, markShuttingDown, predictor };
+  return {
+    wss,
+    httpServer,
+    rooms,
+    ipConnectionCount,
+    rateLimiter,
+    metrics,
+    markShuttingDown,
+    sessionManager: sessions,
+    instanceId: resolvedInstanceId,
+    saveAllSessions,
+    storage,
+  };
 }
