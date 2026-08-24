@@ -1,5 +1,4 @@
 import http from "node:http";
-import { randomBytes } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { URL } from "node:url";
 import { v4 as uuid } from "uuid";
@@ -13,6 +12,16 @@ import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { VALIDATION_ERROR } from "./errors.js";
 import { createStorageAdapter } from "./storage.js";
+import {
+  baseEventType,
+  createEventSourcing,
+  AcknowledgeCommand,
+  JoinRoomCommand,
+  LeaveRoomCommand,
+  NegativeAcknowledgeCommand,
+  PublishLocationCommand,
+  ResumeSessionCommand,
+} from "./event-sourcing.js";
 
 const AFFINITY_COOKIE = "GW_AFFINITY";
 const AFFINITY_MAX_AGE_S = 3600;
@@ -89,7 +98,7 @@ function sessionIdFromToken(token) {
  * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
  */
 export function createServer({
-  _port,
+  port,
   heartbeatMs,
   maxPayloadBytes,
   connRateLimit,
@@ -110,6 +119,7 @@ export function createServer({
   instanceId,
   redis,
   storageAdapter,
+  eventSourcing,
 } = {}) {
   let isShuttingDown = false;
   let isReady = true;
@@ -143,17 +153,43 @@ export function createServer({
   const ownsStorage = storageAdapter == null;
   const storage = storageAdapter ?? createStorageAdapter();
 
+  // Event-sourcing stack (CQRS write side + projections). Defaults to an
+  // in-memory event store so no database is required; inject `eventSourcing`
+  // (or a full `createEventSourcing({ eventStore })` result) to persist.
+  const es = eventSourcing ?? createEventSourcing();
+  const { commands } = es;
+
+  /**
+   * Delivery reaction to committed LocationUpdated events: broadcasts the
+   * wire frame to room members (excluding sender) and persists via the
+   * legacy storage adapter for backwards compatibility.
+   *
+   * @param {string} clientId
+   * @param {object} payload
+   */
+  function deliverLocationUpdate(clientId, payload) {
+    const roomIds = rooms.getClientRooms(clientId);
+    for (const roomId of roomIds) {
+      rooms.broadcast(roomId, {
+        type: "location_update",
+        payload: { clientId, ...payload },
+      }, clientId);
+
+      storage.saveLocation(clientId, roomId, payload).catch((err) => {
+        logger.error("Failed to persist location", { clientId, roomId, error: err.message });
+      });
+    }
+  }
+
+  commands.subscribe((events) => {
+    for (const event of events) {
+      if (baseEventType(event.eventType) === "location_update") {
+        deliverLocationUpdate(event.aggregateId, event.payload);
+      }
+    }
+  });
+
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
-
-  let isReady = false;
-
-  const sessions = sessionManager;
-  const liveClients = new Map();
-
-  const localSessions = new Map();
-  const sessionTtl = Number(process.env.SESSION_TTL_MS) || 3600000;
-  let ownsSessions = true;
-  let _pendingResume = null;
 
   const httpServer = http.createServer((req, res) => {
     let url;
@@ -250,6 +286,24 @@ export function createServer({
         "# TYPE gateway_event_loop_lag_ms gauge",
         `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
       ];
+      if (es) {
+        const snapshotCount =
+          es.vehicles.snapshot_count + es.roomsRepo.snapshot_count + es.fleets.snapshot_count;
+        lines.push(
+          "# TYPE event_store_append_duration_ms gauge",
+          `event_store_append_duration_ms ${Number(es.eventStore.event_store_append_duration_ms ?? 0).toFixed(3)}`,
+          "# TYPE event_store_appends_total counter",
+          `event_store_appends_total ${es.eventStore.event_store_appends_total ?? 0}`,
+          "# TYPE projection_lag_events gauge",
+          `projection_lag_events ${es.projections.projection_lag_events ?? 0}`,
+          "# TYPE snapshot_count counter",
+          `snapshot_count ${snapshotCount}`,
+          "# TYPE commands_total counter",
+          `commands_total ${es.commands.commands_total ?? 0}`,
+          "# TYPE commands_deduplicated_total counter",
+          `commands_deduplicated_total ${es.commands.commands_deduplicated_total ?? 0}`
+        );
+      }
       if (sessions) {
         const sm = sessions.metrics;
         lines.push(
@@ -292,10 +346,6 @@ export function createServer({
   });
   const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
-  const predictor = new PredictiveEngine({
-    geofenceEngine: null,
-    roomManager: rooms,
-  });
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
   const MAX_MESSAGES_PER_SECOND =
@@ -331,7 +381,7 @@ export function createServer({
    * @param {import("http").IncomingMessage} req
    * @returns {object}
    */
-  function _createContext(clientId, req) {
+  function createContext(clientId, req) {
     return {
       clientId,
       ip: req.socket.remoteAddress,
@@ -416,10 +466,10 @@ export function createServer({
    * @param {object|null} ctx
    */
   function touchSession(ctx) {
-    if (!sessionManager || !ctx) return;
+    if (!sessions || !ctx) return;
     ctx.lastActivityAt = Date.now();
     rememberLocal(ctx.clientId, captureState(ctx));
-    sessionManager.debouncedSave(ctx.clientId, () => captureState(ctx)).catch((err) => {
+    sessions.debouncedSave(ctx.clientId, () => captureState(ctx)).catch((err) => {
       logger.error("Failed to schedule session save", { clientId: ctx.clientId, error: err.message });
     });
   }
@@ -471,6 +521,16 @@ export function createServer({
 
     safeSend(ws, { type: "session_resumed", payload: { rooms: restored, currentSeqPerRoom } });
     logger.info("Session resumed", { clientId: ctx.clientId, rooms: restored.length });
+    commands.dispatch(new ResumeSessionCommand({
+      commandId: uuid(),
+      clientId: ctx.clientId,
+      rooms: restored,
+    })).catch((err) => {
+      logger.error("Failed to record SessionResumed event", {
+        clientId: ctx.clientId,
+        error: err.message,
+      });
+    });
     touchSession(ctx);
   }
 
@@ -491,7 +551,7 @@ export function createServer({
     if (sessionId) {
       // `load()` counts decrypt_failed / expired; success is recorded here,
       // after the identity check, so a mismatch is not also a success.
-      const state = await sessionManager.load(sessionId, { countSuccess: false });
+      const state = await sessions.load(sessionId, { countSuccess: false });
       if (!state) {
         logger.info("Session not resumable", { clientId: ctx.clientId });
         return false;
@@ -530,12 +590,12 @@ export function createServer({
    * @returns {Promise<string|null>} The blob, or null when the client is unknown.
    */
   async function migrateClient(clientId) {
-    const ctx = sessionManager ? liveClients.get(clientId) : null;
+    const ctx = sessions ? liveClients.get(clientId) : null;
     if (!ctx) return null;
 
-    await sessionManager.flush(clientId);
+    await sessions.flush(clientId);
     const state = captureState(ctx);
-    const blob = await sessionManager.save(clientId, state);
+    const blob = await sessions.save(clientId, state);
     rememberLocal(clientId, state);
 
     if (Buffer.byteLength(blob, "utf8") <= MAX_CLOSE_REASON_BYTES) {
@@ -553,17 +613,17 @@ export function createServer({
    *
    * @returns {Promise<Map<string, string>>} clientId → fresh session blob.
    */
-  async function _saveAllSessions() {
+  async function saveAllSessions() {
     /** @type {Map<string, string>} */
     const blobs = new Map();
-    if (!sessionManager) return blobs;
+    if (!sessions) return blobs;
 
-    await sessionManager.flushAll();
+    await sessions.flushAll();
     for (const ctx of liveClients.values()) {
       const state = captureState(ctx);
       rememberLocal(ctx.clientId, state);
       try {
-        blobs.set(ctx.clientId, await sessionManager.save(ctx.clientId, state));
+        blobs.set(ctx.clientId, await sessions.save(ctx.clientId, state));
       } catch (err) {
         logger.error("Failed to save session", { clientId: ctx.clientId, error: err.message });
       }
@@ -571,7 +631,7 @@ export function createServer({
     return blobs;
   }
 
-  if (sessionManager) {
+  if (sessions) {
     wss.on("headers", (headers) => {
       headers.push(
         `Set-Cookie: ${AFFINITY_COOKIE}=${resolvedInstanceId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${AFFINITY_MAX_AGE_S}`
@@ -686,6 +746,20 @@ export function createServer({
           }
           logger.info("Client joined room", { clientId: identity.clientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+          // Record membership in the event store (write side). The read-model
+          // join above already succeeded; persistence failures are logged and
+          // never break the realtime path.
+          commands.dispatch(new JoinRoomCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+          })).catch((err) => {
+            logger.error("Failed to record RoomJoined event", {
+              clientId: identity.clientId,
+              roomId: msg.roomId,
+              error: err.message,
+            });
+          });
           touchSession(ctx);
           break;
         }
@@ -698,6 +772,17 @@ export function createServer({
           }
           logger.info("Client left room", { clientId: identity.clientId, roomId: msg.roomId });
           safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          commands.dispatch(new LeaveRoomCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+          })).catch((err) => {
+            logger.error("Failed to record RoomLeft event", {
+              clientId: identity.clientId,
+              roomId: msg.roomId,
+              error: err.message,
+            });
+          });
           touchSession(ctx);
           break;
         }
@@ -716,12 +801,35 @@ export function createServer({
         case "ack": {
           metrics.messages.ack++;
           rooms.ack(identity.clientId, msg.roomId, msg.seq);
+          commands.dispatch(new AcknowledgeCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+            seq: msg.seq,
+          })).catch((err) => {
+            logger.error("Failed to record MessageAcknowledged event", {
+              clientId: identity.clientId,
+              error: err.message,
+            });
+          });
           break;
         }
         case "nack": {
           metrics.messages.nack++;
           logger.warn("NACK received", { clientId: identity.clientId, roomId: msg.roomId, seq: msg.seq, reason: msg.reason });
           rooms.nack(identity.clientId, msg.roomId, msg.seq);
+          commands.dispatch(new NegativeAcknowledgeCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+            seq: msg.seq,
+            reason: msg.reason,
+          })).catch((err) => {
+            logger.error("Failed to record MessageNacked event", {
+              clientId: identity.clientId,
+              error: err.message,
+            });
+          });
           break;
         }
         case "token_refresh": {
@@ -760,16 +868,30 @@ export function createServer({
         }
         case "location_update": {
           metrics.messages.location_update++;
-          const roomIds = rooms.getClientRooms(identity.clientId);
-          for (const roomId of roomIds) {
-            rooms.broadcast(roomId, {
-              type: "location_update",
-              payload: { clientId: identity.clientId, ...msg.payload },
-            }, identity.clientId);
-
-            storage.saveLocation(identity.clientId, roomId, msg.payload).catch((err) => {
-              logger.error("Failed to persist location", { clientId: identity.clientId, roomId, error: err.message });
+          // Write side: the location is committed to the event store as an
+          // immutable LocationUpdated event (causationId = commandId). The
+          // broadcast + legacy persistence happen as a reaction to the commit
+          // (see commands.subscribe above). If the store rejects the write we
+          // degrade gracefully: log and deliver directly so realtime never
+          // depends on storage availability.
+          try {
+            const produced = await commands.dispatch(new PublishLocationCommand({
+              commandId: typeof msg.commandId === "string" && msg.commandId.length > 0
+                ? msg.commandId
+                : uuid(),
+              clientId: identity.clientId,
+              payload: msg.payload,
+            }));
+            if (produced.length === 0) {
+              // Duplicate commandId — already committed and delivered once.
+              logger.debug?.("Duplicate location command ignored", { clientId: identity.clientId });
+            }
+          } catch (err) {
+            logger.error("Failed to record LocationUpdated event", {
+              clientId: identity.clientId,
+              error: err.message,
             });
+            deliverLocationUpdate(identity.clientId, msg.payload);
           }
           touchSession(ctx);
           break;
@@ -849,6 +971,12 @@ export function createServer({
     if (ownsStorage) storage.close().catch((err) => {
       logger.error("Failed to close storage adapter", { error: err.message });
     });
+    if (eventSourcing == null) {
+      // Only close stacks this server created.
+      es.eventStore.close().catch((err) => {
+        logger.error("Failed to close event store", { error: err.message });
+      });
+    }
     httpServer.close();
   });
 
@@ -864,5 +992,6 @@ export function createServer({
     instanceId: resolvedInstanceId,
     saveAllSessions,
     storage,
+    eventSourcing: es,
   };
 }
