@@ -1,6 +1,7 @@
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
+import { URL } from "node:url";
 import { v4 as uuid } from "uuid";
 import jwt from "jsonwebtoken";
 import { RoomManager } from "./room-manager.js";
@@ -88,7 +89,7 @@ function sessionIdFromToken(token) {
  * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
  */
 export function createServer({
-  port,
+  _port,
   heartbeatMs,
   maxPayloadBytes,
   connRateLimit,
@@ -143,6 +144,16 @@ export function createServer({
   const storage = storageAdapter ?? createStorageAdapter();
 
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
+
+  let isReady = false;
+
+  const sessions = sessionManager;
+  const liveClients = new Map();
+
+  const localSessions = new Map();
+  const sessionTtl = Number(process.env.SESSION_TTL_MS) || 3600000;
+  let ownsSessions = true;
+  let _pendingResume = null;
 
   const httpServer = http.createServer((req, res) => {
     let url;
@@ -320,7 +331,7 @@ export function createServer({
    * @param {import("http").IncomingMessage} req
    * @returns {object}
    */
-  function createContext(clientId, req) {
+  function _createContext(clientId, req) {
     return {
       clientId,
       ip: req.socket.remoteAddress,
@@ -486,14 +497,14 @@ export function createServer({
         return false;
       }
       if (state.clientId !== ctx.clientId) {
-        sessionManager.recordResumption("mismatch");
+        sessions?.recordResumption("mismatch");
         logger.warn("Session identity mismatch", {
           clientId: ctx.clientId,
           sessionClientId: state.clientId,
         });
         return false;
       }
-      sessionManager.recordResumption("success");
+      sessions?.recordResumption("success");
       restoreSession(ws, ctx, state);
       return true;
     }
@@ -502,13 +513,13 @@ export function createServer({
     if (affinity === resolvedInstanceId) {
       const cached = readLocal(ctx.clientId);
       if (cached) {
-        sessionManager.recordResumption("success");
+        sessions?.recordResumption("success");
         restoreSession(ws, ctx, cached);
         return true;
       }
     }
 
-    sessionManager.recordResumption("new_session");
+    sessions?.recordResumption("new_session");
     return false;
   }
 
@@ -542,7 +553,7 @@ export function createServer({
    *
    * @returns {Promise<Map<string, string>>} clientId → fresh session blob.
    */
-  async function saveAllSessions() {
+  async function _saveAllSessions() {
     /** @type {Map<string, string>} */
     const blobs = new Map();
     if (!sessionManager) return blobs;
