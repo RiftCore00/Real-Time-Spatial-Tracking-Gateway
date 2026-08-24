@@ -1,5 +1,6 @@
 import http from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
+import { URL } from "node:url";
 import { v4 as uuid } from "uuid";
 import jwt from "jsonwebtoken";
 import { RoomManager } from "./room-manager.js";
@@ -11,17 +12,28 @@ import { logger } from "./logger.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { createConnRateLimiter } from "./conn-rate-limiter.js";
 import { VALIDATION_ERROR } from "./errors.js";
+import { createStorageAdapter } from "./storage.js";
+import {
+  baseEventType,
+  createEventSourcing,
+  AcknowledgeCommand,
+  JoinRoomCommand,
+  LeaveRoomCommand,
+  NegativeAcknowledgeCommand,
+  PublishLocationCommand,
+  ResumeSessionCommand,
+} from "./event-sourcing.js";
 
 const AFFINITY_COOKIE = "GW_AFFINITY";
 const AFFINITY_MAX_AGE_S = 3600;
 const DEFAULT_SESSION_TTL_MS = 3600000;
-const PROTOCOL_VERSION = 3;
 const RATE_WINDOW_MS = 1000;
 const MAX_LOCAL_SESSIONS = 10000;
 const MAX_CLOSE_REASON_BYTES = 123;
 const MIGRATE_CLOSE_CODE = 4100;
 const MIGRATE_PATH = /^\/admin\/v1\/clients\/([^/]+)\/migrate$/;
-const LAG_SAMPLE_MS = Number(process.env.LAG_SAMPLE_MS) || 5000;
+const PROTOCOL_VERSION = 1;
+const LAG_SAMPLE_MS = 1000;
 
 /**
  * Reads one cookie out of a raw `Cookie` header.
@@ -116,6 +128,8 @@ export function createServer({
   sessionTtlMs,
   instanceId,
   redis,
+  storageAdapter,
+  eventSourcing,
 } = {}) {
   let isShuttingDown = false;
   let isReady = true;
@@ -124,36 +138,73 @@ export function createServer({
     messages: { location_update: 0, join_room: 0, leave_room: 0, ack: 0, nack: 0 },
     rateLimitRejections: { connection: 0 },
     authFailures: 0,
-    sessionResumption: { success: 0, decrypt_failed: 0, expired: 0, mismatch: 0, new_session: 0 },
     eventLoopLagMs: 0,
   };
 
-  // --- Session manager wiring (opt-in) -------------------------------------
-  const resolvedInstanceId = instanceId ?? process.env.INSTANCE_ID ?? uuid();
   const sessionKey = sessionEncryptionKey ?? process.env.SESSION_ENCRYPTION_KEY ?? null;
   const sessionTtl = sessionTtlMs ?? (Number(process.env.SESSION_TTL_MS) || DEFAULT_SESSION_TTL_MS);
-  /** True when we constructed the manager ourselves and therefore own its lifecycle. */
   const ownsSessions = sessionManager == null && sessionKey != null;
-  /** @type {SessionManager|null} */
+  /** @type {import("./session-manager.js").SessionManager|null} */
   const sessions = ownsSessions
     ? new SessionManager({
         redis: redis ?? null,
         encryptionKey: sessionKey,
         ttlMs: sessionTtl,
+        logger,
       })
     : (sessionManager ?? null);
+  const resolvedInstanceId = instanceId ?? process.env.INSTANCE_ID ?? uuid();
 
   /** @type {Map<string, object>} clientId → live connection context */
   const liveClients = new Map();
   /** @type {Map<string, object>} clientId → last known state, for the sticky-cookie path */
   const localSessions = new Map();
 
+  const ownsStorage = storageAdapter == null;
+  const storage = storageAdapter ?? createStorageAdapter();
+
+  // Event-sourcing stack (CQRS write side + projections). Defaults to an
+  // in-memory event store so no database is required; inject `eventSourcing`
+  // (or a full `createEventSourcing({ eventStore })` result) to persist.
+  const es = eventSourcing ?? createEventSourcing();
+  const { commands } = es;
+
+  /**
+   * Delivery reaction to committed LocationUpdated events: broadcasts the
+   * wire frame to room members (excluding sender) and persists via the
+   * legacy storage adapter for backwards compatibility.
+   *
+   * @param {string} clientId
+   * @param {object} payload
+   */
+  function deliverLocationUpdate(clientId, payload) {
+    const roomIds = rooms.getClientRooms(clientId);
+    for (const roomId of roomIds) {
+      rooms.broadcast(roomId, {
+        type: "location_update",
+        payload: { clientId, ...payload },
+      }, clientId);
+
+      storage.saveLocation(clientId, roomId, payload).catch((err) => {
+        logger.error("Failed to persist location", { clientId, roomId, error: err.message });
+      });
+    }
+  }
+
+  commands.subscribe((events) => {
+    for (const event of events) {
+      if (baseEventType(event.eventType) === "location_update") {
+        deliverLocationUpdate(event.aggregateId, event.payload);
+      }
+    }
+  });
+
   const effectiveMaxRoomSize = maxRoomSize ?? (Number(process.env.MAX_ROOM_SIZE) || undefined);
 
   const httpServer = http.createServer((req, res) => {
     let url;
     try {
-      url = new URL(req.url, "http://localhost");
+      url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     } catch {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Bad Request" }));
@@ -224,7 +275,7 @@ export function createServer({
       return;
     }
 
-    if (pathname === "/metrics") {
+    if (url.pathname === "/metrics") {
       const mem = process.memoryUsage();
       const lines = [
         "# TYPE gateway_connections_active gauge",
@@ -246,15 +297,36 @@ export function createServer({
         "# TYPE gateway_event_loop_lag_ms gauge",
         `gateway_event_loop_lag_ms ${metrics.eventLoopLagMs}`,
       ];
-      // Issue #18 counters are only meaningful with resumption enabled.
+      if (es) {
+        const snapshotCount =
+          es.vehicles.snapshot_count + es.roomsRepo.snapshot_count + es.fleets.snapshot_count;
+        lines.push(
+          "# TYPE event_store_append_duration_ms gauge",
+          `event_store_append_duration_ms ${Number(es.eventStore.event_store_append_duration_ms ?? 0).toFixed(3)}`,
+          "# TYPE event_store_appends_total counter",
+          `event_store_appends_total ${es.eventStore.event_store_appends_total ?? 0}`,
+          "# TYPE projection_lag_events gauge",
+          `projection_lag_events ${es.projections.projection_lag_events ?? 0}`,
+          "# TYPE snapshot_count counter",
+          `snapshot_count ${snapshotCount}`,
+          "# TYPE commands_total counter",
+          `commands_total ${es.commands.commands_total ?? 0}`,
+          "# TYPE commands_deduplicated_total counter",
+          `commands_deduplicated_total ${es.commands.commands_deduplicated_total ?? 0}`
+        );
+      }
       if (sessions) {
-        const m = sessions.metrics;
-        lines.push("# TYPE session_resumption_total counter");
-        for (const result of ["success", "decrypt_failed", "expired", "mismatch", "new_session"]) {
-          lines.push(`session_resumption_total{result="${result}"} ${m.session_resumption_total?.[result] ?? 0}`);
-        }
-        lines.push("# TYPE session_state_size_bytes gauge");
-        lines.push(`session_state_size_bytes ${m.session_state_size_bytes ?? 0}`);
+        const sm = sessions.metrics;
+        lines.push(
+          "# TYPE session_resumption_total counter",
+          `session_resumption_total{result="success"} ${sm.session_resumption_total.success}`,
+          `session_resumption_total{result="decrypt_failed"} ${sm.session_resumption_total.decrypt_failed}`,
+          `session_resumption_total{result="expired"} ${sm.session_resumption_total.expired}`,
+          `session_resumption_total{result="mismatch"} ${sm.session_resumption_total.mismatch}`,
+          `session_resumption_total{result="new_session"} ${sm.session_resumption_total.new_session}`,
+          "# TYPE session_state_size_bytes gauge",
+          `session_state_size_bytes ${sm.session_state_size_bytes}`
+        );
       }
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(lines.join("\n"));
@@ -269,6 +341,8 @@ export function createServer({
     server: httpServer,
     maxPayload: maxPayloadBytes ?? 1024,
   });
+
+  httpServer.listen(port ?? 8080);
 
   const rooms = new RoomManager({
     maxRoomSize: effectiveMaxRoomSize,
@@ -481,6 +555,16 @@ export function createServer({
 
     safeSend(ws, { type: "session_resumed", payload: { rooms: restored, currentSeqPerRoom } });
     logger.info("Session resumed", { clientId: ctx.clientId, rooms: restored.length });
+    commands.dispatch(new ResumeSessionCommand({
+      commandId: uuid(),
+      clientId: ctx.clientId,
+      rooms: restored,
+    })).catch((err) => {
+      logger.error("Failed to record SessionResumed event", {
+        clientId: ctx.clientId,
+        error: err.message,
+      });
+    });
     touchSession(ctx);
   }
 
@@ -507,14 +591,14 @@ export function createServer({
         return false;
       }
       if (state.clientId !== ctx.clientId) {
-        sessions.recordResumption("mismatch");
+        sessions?.recordResumption("mismatch");
         logger.warn("Session identity mismatch", {
           clientId: ctx.clientId,
           sessionClientId: state.clientId,
         });
         return false;
       }
-      sessions.recordResumption("success");
+      sessions?.recordResumption("success");
       restoreSession(ws, ctx, state);
       return true;
     }
@@ -523,13 +607,13 @@ export function createServer({
     if (affinity === resolvedInstanceId) {
       const cached = readLocal(ctx.clientId);
       if (cached) {
-        sessions.recordResumption("success");
+        sessions?.recordResumption("success");
         restoreSession(ws, ctx, cached);
         return true;
       }
     }
 
-    sessions.recordResumption("new_session");
+    sessions?.recordResumption("new_session");
     return false;
   }
 
@@ -589,7 +673,7 @@ export function createServer({
     });
   }
 
-  wss.on("connection", (ws, req) => {
+  wss.on("connection", async (ws, req) => {
     const clientId = uuid();
     ws.isAlive = true;
     ws._lastPongAt = Date.now();
@@ -681,182 +765,264 @@ export function createServer({
     });
 
     const token = url.searchParams.get("token");
+    let authResult;
+    try {
+      authResult = await verifyConnection(token);
+    } catch {
+      ws.close(4001, "Authentication failed");
+      return;
+    }
 
-    verifyConnection(token).then(async (authResult) => {
-      if (!authResult.ok) {
-        logger.warn("Authentication failed", { clientId, reason: authResult.error });
-        metrics.authFailures++;
-        ws.close(4001, authResult.error);
+    if (!authResult.ok) {
+      logger.warn("Authentication failed", { clientId, reason: authResult.error });
+      metrics.authFailures++;
+      ws.close(4001, authResult.error);
+      return;
+    }
+
+    const identity = { clientId: authResult.clientId ?? clientId };
+    ws._clientId = identity.clientId;
+    logger.info("Client connected", { clientId: identity.clientId, ip });
+
+    ws.on("pong", heartbeat);
+
+    const ctx = sessions ? createContext(identity.clientId, req) : null;
+    if (ctx) {
+      ctx.ws = ws;
+      liveClients.set(identity.clientId, ctx);
+    }
+    /** @type {Promise<unknown>|null} Frames wait for the handshake so replayed state lands first. */
+    let pendingResume = null;
+    if (ctx) {
+      pendingResume = resumeSession(ws, req, url, ctx, token).catch((err) => {
+        logger.error("Session resumption failed", { clientId: ctx.clientId, error: err.message });
+      });
+    }
+
+    ws.on("message", async (raw) => {
+      if (pendingResume) {
+        await pendingResume;
+        pendingResume = null;
+      }
+
+      if (!rateLimiter.check(identity.clientId)) {
+        logger.warn("Message rate limit exceeded", { clientId: identity.clientId });
+        safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
+        return;
+      }
+      if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
+
+      const validation = validateMessage(raw.toString());
+
+      if (!validation.ok) {
+        logger.warn("Validation failed", { clientId: identity.clientId, error: validation.error });
+        sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
         return;
       }
 
-      identity = { clientId: authResult.clientId ?? clientId };
-      ws._clientId = identity.clientId;
-      logger.info("Client connected", { clientId: identity.clientId, ip });
+      const msg = validation.data;
 
-      ws.on("pong", heartbeat);
+      switch (msg.type) {
+        case "join_room": {
+          metrics.messages.join_room++;
+          const joinResult = rooms.join(identity.clientId, msg.roomId, ws);
+          if (joinResult && joinResult.type === "error") {
+            logger.warn("Join rejected", { clientId: identity.clientId, roomId: msg.roomId, code: joinResult.payload.code });
+            safeSend(ws, joinResult);
+            break;
+          }
+          if (joinResult && joinResult.ok === false) {
+            logger.warn("Room is full", { clientId: identity.clientId, roomId: msg.roomId });
+            safeSend(ws, { type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } });
+            break;
+          }
+          logger.info("Client joined room", { clientId: identity.clientId, roomId: msg.roomId });
+          safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
+          // Record membership in the event store (write side). The read-model
+          // join above already succeeded; persistence failures are logged and
+          // never break the realtime path.
+          commands.dispatch(new JoinRoomCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+          })).catch((err) => {
+            logger.error("Failed to record RoomJoined event", {
+              clientId: identity.clientId,
+              roomId: msg.roomId,
+              error: err.message,
+            });
+          });
+          touchSession(ctx);
+          break;
+        }
+        case "leave_room": {
+          metrics.messages.leave_room++;
+          rooms.leave(identity.clientId, msg.roomId);
+          if (ctx) {
+            ctx.ackedSeq.delete(msg.roomId);
+            ctx.geofence.delete(msg.roomId);
+          }
+          logger.info("Client left room", { clientId: identity.clientId, roomId: msg.roomId });
+          safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
+          commands.dispatch(new LeaveRoomCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+          })).catch((err) => {
+            logger.error("Failed to record RoomLeft event", {
+              clientId: identity.clientId,
+              roomId: msg.roomId,
+              error: err.message,
+            });
+          });
+          touchSession(ctx);
+          break;
+        }
+        case "reconnect": {
+          const clientRooms = rooms.getClientRooms(identity.clientId);
+          if (!clientRooms.has(msg.roomId)) {
+            safeSend(ws, { type: "error", payload: { message: "Must join room before reconnecting" } });
+            break;
+          }
+          if (ctx) ctx.ackedSeq.set(msg.roomId, msg.lastSeq);
+          const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq, msg.highestAckedSeq);
+          safeSend(ws, replayResult);
+          touchSession(ctx);
+          break;
+        }
+        case "ack": {
+          metrics.messages.ack++;
+          rooms.ack(identity.clientId, msg.roomId, msg.seq);
+          commands.dispatch(new AcknowledgeCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+            seq: msg.seq,
+          })).catch((err) => {
+            logger.error("Failed to record MessageAcknowledged event", {
+              clientId: identity.clientId,
+              error: err.message,
+            });
+          });
+          break;
+        }
+        case "nack": {
+          metrics.messages.nack++;
+          logger.warn("NACK received", { clientId: identity.clientId, roomId: msg.roomId, seq: msg.seq, reason: msg.reason });
+          rooms.nack(identity.clientId, msg.roomId, msg.seq);
+          commands.dispatch(new NegativeAcknowledgeCommand({
+            commandId: uuid(),
+            clientId: identity.clientId,
+            roomId: msg.roomId,
+            seq: msg.seq,
+            reason: msg.reason,
+          })).catch((err) => {
+            logger.error("Failed to record MessageNacked event", {
+              clientId: identity.clientId,
+              error: err.message,
+            });
+          });
+          break;
+        }
+        case "token_refresh": {
+          try {
+            const decoded = jwt.decode(msg.token, { complete: true });
+            if (!decoded) {
+              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+              break;
+            }
+            verifyConnection(msg.token).then((refreshResult) => {
+              if (!refreshResult.ok) {
+                safeSend(ws, { type: "error", payload: { message: refreshResult.error } });
+                return;
+              }
+              const oldClientId = identity.clientId;
+              const newClientId = refreshResult.clientId;
+              authResult = refreshResult;
+              identity.clientId = newClientId;
+              ws._clientId = newClientId;
+              rooms.updateClientId(oldClientId, newClientId);
+              rateLimiter.remove(oldClientId);
+              if (ctx && oldClientId !== newClientId) {
+                if (liveClients.get(oldClientId) === ctx) liveClients.delete(oldClientId);
+                ctx.clientId = newClientId;
+                liveClients.set(newClientId, ctx);
+              }
+              safeSend(ws, { type: "token_refresh_ok", payload: { clientId: newClientId } });
+              touchSession(ctx);
+            }).catch(() => {
+              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+            });
+          } catch {
+            safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
+          }
+          break;
+        }
+        case "location_update": {
+          metrics.messages.location_update++;
+          // Write side: the location is committed to the event store as an
+          // immutable LocationUpdated event (causationId = commandId). The
+          // broadcast + legacy persistence happen as a reaction to the commit
+          // (see commands.subscribe above). If the store rejects the write we
+          // degrade gracefully: log and deliver directly so realtime never
+          // depends on storage availability.
+          try {
+            const produced = await commands.dispatch(new PublishLocationCommand({
+              commandId: typeof msg.commandId === "string" && msg.commandId.length > 0
+                ? msg.commandId
+                : uuid(),
+              clientId: identity.clientId,
+              payload: msg.payload,
+            }));
+            if (produced.length === 0) {
+              // Duplicate commandId — already committed and delivered once.
+              logger.debug?.("Duplicate location command ignored", { clientId: identity.clientId });
+            }
+          } catch (err) {
+            logger.error("Failed to record LocationUpdated event", {
+              clientId: identity.clientId,
+              error: err.message,
+            });
+            deliverLocationUpdate(identity.clientId, msg.payload);
+          }
+          touchSession(ctx);
+          break;
+        }
+      }
+    });
 
-      if (sessions) {
-        ctx = createContext(identity.clientId, req);
-        ctx.ws = ws;
-        liveClients.set(identity.clientId, ctx);
-
-        // Resumption completes before any queued frame is processed, so
-        // replayed state always lands ahead of live traffic.
-        await resumeSession(ws, req, url, ctx, token).catch((err) => {
-          logger.error("Session resumption failed", { clientId: identity.clientId, error: err.message });
+    ws.on("close", (code, reason) => {
+      if (ctx) {
+        // Snapshot before teardown so a pending save cannot persist empty rooms.
+        ctx.frozenState = captureState(ctx);
+        rememberLocal(ctx.clientId, ctx.frozenState);
+        if (liveClients.get(ctx.clientId) === ctx) liveClients.delete(ctx.clientId);
+        sessions.flush(ctx.clientId).catch((err) => {
+          logger.error("Failed to flush session on close", { clientId: ctx.clientId, error: err.message });
         });
       }
 
-      dispatchMessage = (raw) => {
-        if (!rateLimiter.check(identity.clientId)) {
-          logger.warn("Message rate limit exceeded", { clientId: identity.clientId });
-          safeSend(ws, { type: "error", payload: { message: "Rate limit exceeded" } });
-          return;
+      rooms.disconnect(identity.clientId);
+      rateLimiter.remove(identity.clientId);
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
         }
-        if (ctx) ctx.messageWindow = pruneWindow([...ctx.messageWindow, Date.now()]);
+        connRateLimiter.cleanup(trackedIp);
+      }
+      logger.info("Client disconnected", {
+        clientId: identity.clientId,
+        code,
+        reason: reason?.toString() ?? "unknown",
+      });
+    });
 
-        const validation = validateMessage(raw.toString());
-
-        if (!validation.ok) {
-          logger.warn("Validation failed", { clientId: identity.clientId, error: validation.error });
-          sendError(ws, validation.error, validation.code ?? VALIDATION_ERROR);
-          return;
-        }
-
-        const msg = validation.data;
-
-        switch (msg.type) {
-          case "join_room": {
-            metrics.messages.join_room++;
-            const joinResult = rooms.join(identity.clientId, msg.roomId, ws);
-            if (joinResult && joinResult.type === "error") {
-              logger.warn("Join rejected", { clientId: identity.clientId, roomId: msg.roomId, code: joinResult.payload.code });
-              safeSend(ws, joinResult);
-              break;
-            }
-            if (joinResult && joinResult.ok === false) {
-              logger.warn("Room is full", { clientId: identity.clientId, roomId: msg.roomId });
-              safeSend(ws, { type: "error", payload: { message: "Room is full", code: "ROOM_FULL" } });
-              break;
-            }
-            logger.info("Client joined room", { clientId: identity.clientId, roomId: msg.roomId });
-            safeSend(ws, { type: "room_joined", payload: { roomId: msg.roomId } });
-            touchSession(ctx);
-            break;
-          }
-          case "leave_room": {
-            metrics.messages.leave_room++;
-            rooms.leave(identity.clientId, msg.roomId);
-            if (ctx) {
-              ctx.ackedSeq.delete(msg.roomId);
-              ctx.geofence.delete(msg.roomId);
-            }
-            logger.info("Client left room", { clientId: identity.clientId, roomId: msg.roomId });
-            safeSend(ws, { type: "room_left", payload: { roomId: msg.roomId } });
-            touchSession(ctx);
-            break;
-          }
-          case "reconnect": {
-            const clientRooms = rooms.getClientRooms(identity.clientId);
-            if (!clientRooms.has(msg.roomId)) {
-              safeSend(ws, { type: "error", payload: { message: "Must join room before reconnecting" } });
-              break;
-            }
-            if (ctx) ctx.ackedSeq.set(msg.roomId, Number(msg.lastSeq) || 0);
-            const replayResult = rooms.handleReconnect(msg.roomId, msg.lastSeq, msg.highestAckedSeq);
-            safeSend(ws, replayResult);
-            touchSession(ctx);
-            break;
-          }
-          case "ack": {
-            metrics.messages.ack++;
-            rooms.ack(identity.clientId, msg.roomId, msg.seq);
-            break;
-          }
-          case "nack": {
-            metrics.messages.nack++;
-            logger.warn("NACK received", { clientId: identity.clientId, roomId: msg.roomId, seq: msg.seq, reason: msg.reason });
-            rooms.nack(identity.clientId, msg.roomId, msg.seq);
-            break;
-          }
-          case "token_refresh": {
-            try {
-              const decoded = jwt.decode(msg.token, { complete: true });
-              if (!decoded) {
-                safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-                break;
-              }
-              verifyConnection(msg.token).then((refreshResult) => {
-                if (!refreshResult.ok) {
-                  safeSend(ws, { type: "error", payload: { message: refreshResult.error } });
-                  return;
-                }
-                const oldClientId = identity.clientId;
-                const newClientId = refreshResult.clientId;
-                identity.clientId = newClientId;
-                ws._clientId = newClientId;
-                rooms.updateClientId(oldClientId, newClientId);
-                rateLimiter.remove(oldClientId);
-                if (ctx && oldClientId !== newClientId) {
-                  if (liveClients.get(oldClientId) === ctx) liveClients.delete(oldClientId);
-                  ctx.clientId = newClientId;
-                  liveClients.set(newClientId, ctx);
-                }
-                // Carry the Kalman filter across the identity change so
-                // prediction continuity survives a token rotation.
-                const predictorState = predictor.serializeState(oldClientId);
-                if (predictorState) {
-                  predictor.removeClient(oldClientId);
-                  predictor.restoreState(newClientId, predictorState);
-                }
-                touchSession(ctx);
-                safeSend(ws, { type: "token_refresh_ok", payload: { clientId: newClientId } });
-              }).catch(() => {
-                safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-              });
-            } catch {
-              safeSend(ws, { type: "error", payload: { message: "Invalid refresh token" } });
-            }
-            break;
-          }
-          case "location_update": {
-            metrics.messages.location_update++;
-            const roomIds = [...rooms.getClientRooms(identity.clientId)];
-            for (const roomId of roomIds) {
-              rooms.broadcast(roomId, {
-                type: "location_update",
-                payload: { clientId: identity.clientId, ...msg.payload },
-              }, identity.clientId);
-            }
-            // Issue #248 integration point: feed the predictive engine after
-            // the update has been broadcast, then emit anomaly and pre-alert
-            // events. Failures must never take down telemetry processing.
-            try {
-              const { anomalies } = predictor.update(identity.clientId, msg.payload);
-              for (const anomalyType of anomalies) {
-                for (const roomId of roomIds) {
-                  broadcastPredictiveEvent(roomId, {
-                    type: anomalyType,
-                    payload: { clientId: identity.clientId },
-                  }, identity.clientId);
-                }
-              }
-              predictor.checkPreAlerts(identity.clientId);
-            } catch (err) {
-              logger.warn("Predictive processing failed", { clientId: identity.clientId, error: err.message });
-            }
-            touchSession(ctx);
-            break;
-          }
-        }
-      };
-
-      ready = true;
-      for (const queued of preReadyQueue) dispatchMessage(queued);
-      preReadyQueue.length = 0;
-    }).catch(() => {
-      ws.close(4001, "Authentication failed");
+    ws.on("error", (err) => {
+      logger.error("WebSocket error", { clientId: identity.clientId, error: err.message });
     });
   });
 
@@ -893,16 +1059,21 @@ export function createServer({
   wss.on("close", () => {
     clearInterval(heartbeatInterval);
     clearInterval(lagInterval);
-    if (ownsSessions && sessions) sessions.close();
-    predictor.close();
+    if (ownsSessions) sessions.close();
+    if (ownsStorage) storage.close().catch((err) => {
+      logger.error("Failed to close storage adapter", { error: err.message });
+    });
+    if (eventSourcing == null) {
+      // Only close stacks this server created.
+      es.eventStore.close().catch((err) => {
+        logger.error("Failed to close event store", { error: err.message });
+      });
+    }
     httpServer.close();
   });
 
-  httpServer.listen(port ?? 8080);
-
   return {
     wss,
-    server: httpServer,
     httpServer,
     rooms,
     ipConnectionCount,
@@ -912,6 +1083,7 @@ export function createServer({
     sessionManager: sessions,
     instanceId: resolvedInstanceId,
     saveAllSessions,
-    predictor,
+    storage,
+    eventSourcing: es,
   };
 }

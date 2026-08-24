@@ -1,801 +1,381 @@
-/**
- * src/predictor.js
- *
- * Predictive location modeling engine (Issue #248).
- *
- * Implements a Constant-Velocity (CV) Kalman filter in local ENU coordinates
- * per tracked client.  Exposes:
- *   - update(clientId, location)          – predict + update cycle
- *   - getTrajectory(clientId, horizons)   – future positions with confidence
- *   - getETA(clientId, targetLat, targetLon) – ETA distribution
- *   - checkPreAlerts(clientId)            – geofence pre-alert emission
- *   - detectAnomalies(clientId, location) – anomaly flags
- *   - removeClient(clientId)              – explicit cleanup
- *
- * No external dependencies – Kalman math implemented from scratch.
- */
 
-import { logger } from "./logger.js";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+const EARTH_RADIUS = 6371000;
+const DEFAULT_CONFIG = {
+  PREDICTOR_ENABLE: true,
+  PREDICTOR_MODEL: "CV",
+  PREDICTOR_PROCESS_NOISE: 0.1,
+  PREDICTOR_MEASUREMENT_NOISE: 5.0,
+  PREDICTOR_PRE_ALERT_HORIZON_S: 60,
+  PREDICTOR_MAX_HORIZON_S: 120,
+  PREDICTOR_RE_ORIGIN_DISTANCE_KM: 50,
+  PREDICTOR_ANOMALY_INNOVATION_SIGMA: 3,
+  PREDICTOR_ANOMALY_MAX_ACCELERATION: 10,
+  PREDICTOR_ANOMALY_MAX_HEADING_RATE: Math.PI / 2,
+  PREDICTOR_ANOMALY_RATE_LIMIT_MS: 60000,
+  PREDICTOR_TTL_MS: 3600000,
+  PREDICTOR_ETA_SAMPLES: 1000,
+};
 
-const EARTH_RADIUS_M = 6_371_000;
-const DEG_TO_RAD = Math.PI / 180;
-const RAD_TO_DEG = 180 / Math.PI;
-
-/** Clients whose filter has not been touched for this long are evicted. */
-const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-/** Origin is re-established when the vehicle has moved this far from it. */
-const ORIGIN_DRIFT_THRESHOLD_M = 50_000; // 50 km
-
-/** Debounce window: don't re-alert the same (clientId, fenceId) pair. */
-const PRE_ALERT_DEBOUNCE_MS = 60_000;
-
-/** Anomaly rate-limit: emit at most 1 event per type per client per minute. */
-const ANOMALY_RATE_LIMIT_MS = 60_000;
-
-/** Sigma multiplier for anomaly thresholds. */
-const ANOMALY_SIGMA = 3;
-
-/** Max speed in m/s considered physically possible (≈ 360 km/h). */
-const MAX_PHYSICAL_SPEED_MS = 100;
-
-/** Max acceleration in m/s² considered physically possible for road vehicles (≈2g). */
-const MAX_PHYSICAL_ACCEL_MS2 = 20;
-
-/** Max heading rate in rad/s considered physically possible. */
-const MAX_PHYSICAL_HEADING_RATE = (Math.PI * 2) / 3; // 120°/s
-
-/** Minimum dt to apply a Kalman predict (avoids divide-by-zero). */
-const MIN_DT_S = 0.01;
-
-/** Interval used when sampling trajectory for geofence checks (seconds). */
-const TRAJECTORY_SAMPLE_INTERVAL_S = 10;
-
-// ---------------------------------------------------------------------------
-// 4×4 matrix helpers (row-major, flat arrays of length 16)
-// ---------------------------------------------------------------------------
-
-/** 4×4 identity matrix. */
-function mat4Identity() {
-  return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-}
-
-/**
- * 4×4 × 4×4 matrix multiplication.
- * @param {number[]} A
- * @param {number[]} B
- * @returns {number[]}
- */
-function mat4Mul(A, B) {
-  const C = new Array(16).fill(0);
-  for (let i = 0; i < 4; i++) {
-    for (let j = 0; j < 4; j++) {
-      let sum = 0;
-      for (let k = 0; k < 4; k++) sum += A[i * 4 + k] * B[k * 4 + j];
-      C[i * 4 + j] = sum;
+function parseConfig(env = process.env) {
+  const config = { ...DEFAULT_CONFIG };
+  for (const key of Object.keys(DEFAULT_CONFIG)) {
+    if (env[key] !== undefined) {
+      const val = env[key];
+      const def = DEFAULT_CONFIG[key];
+      if (typeof def === "boolean") {
+        config[key] = val === "true";
+      } else if (typeof def === "number") {
+        config[key] = Number(val);
+      } else {
+        config[key] = val;
+      }
     }
   }
-  return C;
+  return config;
 }
 
-/**
- * Transpose of a 4×4 matrix.
- * @param {number[]} A
- * @returns {number[]}
- */
-function mat4T(A) {
-  const T = new Array(16).fill(0);
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++) T[j * 4 + i] = A[i * 4 + j];
-  return T;
-}
-
-/**
- * Add two 4×4 matrices.
- * @param {number[]} A
- * @param {number[]} B
- * @returns {number[]}
- */
-function mat4Add(A, B) {
-  return A.map((v, i) => v + B[i]);
-}
-
-/**
- * Multiply 4×4 matrix by a 4-element column vector.
- * @param {number[]} M
- * @param {number[]} v
- * @returns {number[]}
- */
-function mat4MulVec(M, v) {
-  return [
-    M[0] * v[0] + M[1] * v[1] + M[2] * v[2] + M[3] * v[3],
-    M[4] * v[0] + M[5] * v[1] + M[6] * v[2] + M[7] * v[3],
-    M[8] * v[0] + M[9] * v[1] + M[10] * v[2] + M[11] * v[3],
-    M[12] * v[0] + M[13] * v[1] + M[14] * v[2] + M[15] * v[3],
-  ];
-}
-
-// ---------------------------------------------------------------------------
-// 2×2 matrix helpers (for S and confidence ellipse)
-// ---------------------------------------------------------------------------
-
-/**
- * Invert a 2×2 matrix [a,b,c,d] → 1/det * [d,-b,-c,a].
- * @param {number[]} M   flat [a,b,c,d]
- * @returns {number[]|null}
- */
-function mat2Inv(M) {
-  const det = M[0] * M[3] - M[1] * M[2];
-  if (Math.abs(det) < 1e-12) return null;
-  return [M[3] / det, -M[1] / det, -M[2] / det, M[0] / det];
-}
-
-/**
- * Eigenvalues of a symmetric 2×2 matrix.
- * @param {number[]} M  flat [a,b,b,d] (symmetric)
- * @returns {{ lambda1: number, lambda2: number }}
- */
-function sym2Eigen(M) {
-  const a = M[0], b = M[1], d = M[3];
-  const mean = (a + d) / 2;
-  const disc = Math.sqrt(Math.max(0, ((a - d) / 2) ** 2 + b * b));
-  return { lambda1: mean + disc, lambda2: mean - disc };
-}
-
-/**
- * Orientation of the major axis (radians) for a symmetric 2×2 matrix.
- * @param {number[]} M
- * @returns {number}
- */
-function sym2Angle(M) {
-  const a = M[0], b = M[1], d = M[3];
-  if (Math.abs(b) < 1e-10 && a >= d) return 0;
-  if (Math.abs(b) < 1e-10 && a < d) return Math.PI / 2;
-  const mean = (a + d) / 2;
-  const disc = Math.sqrt(Math.max(0, ((a - d) / 2) ** 2 + b * b));
-  const lambda1 = mean + disc;
-  // eigenvector for lambda1: [b, lambda1 - a]
-  return Math.atan2(lambda1 - a, b);
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate transforms
-// ---------------------------------------------------------------------------
-
-/**
- * WGS84 lat/lon → local ENU in metres, relative to (lat0, lon0).
- * @param {number} lat   degrees
- * @param {number} lon   degrees
- * @param {number} lat0  origin latitude degrees
- * @param {number} lon0  origin longitude degrees
- * @returns {{ x: number, y: number }}  east (x) and north (y) in metres
- */
-export function latLonToEnu(lat, lon, lat0, lon0) {
-  const dLat = (lat - lat0) * DEG_TO_RAD;
-  const dLon = (lon - lon0) * DEG_TO_RAD;
-  const x = EARTH_RADIUS_M * dLon * Math.cos(lat0 * DEG_TO_RAD);
-  const y = EARTH_RADIUS_M * dLat;
+function latLonToEnu(lat, lon, lat0, lon0) {
+  const dLat = (lat - lat0) * Math.PI / 180;
+  const dLon = (lon - lon0) * Math.PI / 180;
+  const x = EARTH_RADIUS * dLon * Math.cos(lat0 * Math.PI / 180);
+  const y = EARTH_RADIUS * dLat;
   return { x, y };
 }
 
-/**
- * Local ENU metres → WGS84 lat/lon.
- * @param {number} x   east metres
- * @param {number} y   north metres
- * @param {number} lat0 origin latitude degrees
- * @param {number} lon0 origin longitude degrees
- * @returns {{ lat: number, lon: number }}
- */
-export function enuToLatLon(x, y, lat0, lon0) {
-  const lat = lat0 + (y / EARTH_RADIUS_M) * RAD_TO_DEG;
-  const cosLat0 = Math.cos(lat0 * DEG_TO_RAD);
-  const lon = lon0 + (x / (EARTH_RADIUS_M * (cosLat0 || 1e-10))) * RAD_TO_DEG;
+function enuToLatLon(x, y, lat0, lon0) {
+  const lat = lat0 + y / EARTH_RADIUS * 180 / Math.PI;
+  const lon = lon0 + x / (EARTH_RADIUS * Math.cos(lat0 * Math.PI / 180)) * 180 / Math.PI;
   return { lat, lon };
 }
 
-/**
- * Euclidean distance between two ENU points.
- * @param {number} x1
- * @param {number} y1
- * @param {number} x2
- * @param {number} y2
- * @returns {number}
- */
-function enuDistance(x1, y1, x2, y2) {
-  return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+function distanceEnu(x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
-// ---------------------------------------------------------------------------
-// Kalman filter (CV model, state = [x, y, vx, vy])
-// ---------------------------------------------------------------------------
-
-/**
- * Build the process noise matrix Q for a CV model.
- * Uses the standard DWNA (discrete white noise acceleration) model.
- *
- * @param {number} dt          time step in seconds
- * @param {number} sigmaA      acceleration noise std-dev (m/s²)
- * @returns {number[]}  4×4 flat array
- */
-function buildQ(dt, sigmaA) {
-  const dt2 = dt * dt;
-  const dt3 = dt2 * dt;
-  const dt4 = dt3 * dt;
-  const q = sigmaA * sigmaA;
-  return [
-    q * dt4 / 4, 0, q * dt3 / 2, 0,
-    0, q * dt4 / 4, 0, q * dt3 / 2,
-    q * dt3 / 2, 0, q * dt2, 0,
-    0, q * dt3 / 2, 0, q * dt2,
-  ];
-}
-
-/**
- * Build the state-transition matrix F for a CV model.
- *
- * F = [[1, 0, dt, 0],
- *      [0, 1, 0, dt],
- *      [0, 0, 1,  0],
- *      [0, 0, 0,  1]]
- *
- * @param {number} dt
- * @returns {number[]}  4×4 flat array
- */
-function buildF(dt) {
-  return [
-    1, 0, dt, 0,
-    0, 1, 0, dt,
-    0, 0, 1, 0,
-    0, 0, 0, 1,
-  ];
-}
-
-/**
- * Measurement matrix H (position only).
- * H = [[1, 0, 0, 0],
- *      [0, 1, 0, 0]]
- * Stored as 2-row × 4-col flat array.
- */
-const H = [1, 0, 0, 0, 0, 1, 0, 0];
-
-/**
- * Multiply 2×4 H by 4-element state vector → 2-element vector.
- * @param {number[]} x
- * @returns {number[]}
- */
-function mulHx(x) {
-  return [
-    H[0] * x[0] + H[1] * x[1] + H[2] * x[2] + H[3] * x[3],
-    H[4] * x[0] + H[5] * x[1] + H[6] * x[2] + H[7] * x[3],
-  ];
-}
-
-/**
- * Multiply H (2×4) by P (4×4) → 2×4 matrix (flat).
- * @param {number[]} P
- * @returns {number[]}
- */
-function mulHP(P) {
-  const out = new Array(8).fill(0);
-  for (let i = 0; i < 2; i++)
-    for (let j = 0; j < 4; j++) {
-      let sum = 0;
-      for (let k = 0; k < 4; k++) sum += H[i * 4 + k] * P[k * 4 + j];
-      out[i * 4 + j] = sum;
-    }
-  return out;
-}
-
-/**
- * Multiply P (4×4) by H^T (4×2) → 4×2 matrix (flat).
- *
- * H = [[1,0,0,0],[0,1,0,0]], so H^T = [[1,0],[0,1],[0,0],[0,0]].
- * P H^T simply selects the first two columns of P.
- *
- * @param {number[]} P
- * @returns {number[]}
- */
-function mulPHt(P) {
-  // Result is 4×2; column j of result = column j of P (since H^T[:,j] = e_j for j<2)
-  const out = new Array(8).fill(0);
-  for (let i = 0; i < 4; i++) {
-    out[i * 2 + 0] = P[i * 4 + 0]; // P * H^T column 0 = P[:,0]
-    out[i * 2 + 1] = P[i * 4 + 1]; // P * H^T column 1 = P[:,1]
-  }
-  return out;
-}
-
-/**
- * S = H P H^T + R  (2×2 innovation covariance).
- * @param {number[]} P   4×4
- * @param {number}   r   measurement noise variance (m²)
- * @returns {number[]}   2×2 flat [s00, s01, s10, s11]
- */
-function computeS(P, r) {
-  // HP is 2×4, HP*H^T is 2×2
-  const HP = mulHP(P);
-  // multiply 2×4 HP by H^T (4×2) = 2×2
-  const S = new Array(4).fill(0);
-  for (let i = 0; i < 2; i++)
-    for (let j = 0; j < 2; j++) {
-      let sum = 0;
-      for (let k = 0; k < 4; k++) sum += HP[i * 4 + k] * H[j * 4 + k]; // H^T[k,j] = H[j,k]
-      S[i * 2 + j] = sum;
-    }
-  S[0] += r;
-  S[3] += r;
-  return S;
-}
-
-/**
- * K = P H^T S^{-1}  (4×2 Kalman gain, flat).
- * @param {number[]} P   4×4
- * @param {number[]} S   2×2
- * @returns {number[]|null}  4×2 or null when S is singular
- */
-function computeK(P, S) {
-  const PHt = mulPHt(P);
-  const Sinv = mat2Inv(S);
-  if (!Sinv) return null;
-  // K = (4×2) × (2×2) → 4×2
-  const K = new Array(8).fill(0);
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 2; j++) {
-      let sum = 0;
-      for (let k = 0; k < 2; k++) sum += PHt[i * 2 + k] * Sinv[k * 2 + j];
-      K[i * 2 + j] = sum;
-    }
-  return K;
-}
-
-/**
- * Update state: x_new = x + K y  (K is 4×2, y is 2-element vector).
- * @param {number[]} x
- * @param {number[]} K
- * @param {number[]} y
- * @returns {number[]}
- */
-function applyKx(x, K, y) {
-  return x.map((v, i) => v + K[i * 2] * y[0] + K[i * 2 + 1] * y[1]);
-}
-
-/**
- * Joseph-form covariance update for numerical stability:
- *   P_new = (I - KH) P (I - KH)^T + K R K^T
- *
- * @param {number[]} P    4×4
- * @param {number[]} K    4×2
- * @param {number}   r    measurement noise variance
- * @returns {number[]}  4×4
- */
-function josephUpdate(P, K, r) {
-  // I - KH  (4×4)
-  const I = mat4Identity();
-  // KH = (4×2)(2×4) = 4×4
-  const KH = new Array(16).fill(0);
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++) {
-      let sum = 0;
-      for (let k = 0; k < 2; k++) sum += K[i * 2 + k] * H[k * 4 + j];
-      KH[i * 4 + j] = sum;
-    }
-  const IKH = I.map((v, i) => v - KH[i]);
-
-  // P1 = (I-KH) P (I-KH)^T
-  const P1 = mat4Mul(mat4Mul(IKH, P), mat4T(IKH));
-
-  // K R K^T = r * K K^T  (4×2)(2×4) = 4×4
-  const KKt = new Array(16).fill(0);
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++) {
-      let sum = 0;
-      for (let k = 0; k < 2; k++) sum += K[i * 2 + k] * K[j * 2 + k];
-      KKt[i * 4 + j] = sum;
-    }
-
-  return mat4Add(P1, KKt.map((v) => v * r));
-}
-
-// ---------------------------------------------------------------------------
-// Per-client Kalman filter state
-// ---------------------------------------------------------------------------
-
-/**
- * @typedef {Object} FilterState
- * @property {number[]} x          State vector [x, y, vx, vy]
- * @property {number[]} P          4×4 covariance (flat)
- * @property {number}   originLat
- * @property {number}   originLon
- * @property {number}   lastTimestamp  ms since epoch
- * @property {number}   lastActivityMs ms since epoch
- */
-
-/**
- * Create a new filter state seeded from the first valid measurement.
- * @param {number} enuX
- * @param {number} enuY
- * @param {number} vx
- * @param {number} vy
- * @param {number} originLat
- * @param {number} originLon
- * @param {number} timestampMs
- * @param {number} measurementNoiseM  1σ of GPS noise in metres
- * @returns {FilterState}
- */
-function initFilter(enuX, enuY, vx, vy, originLat, originLon, timestampMs, measurementNoiseM) {
-  const posVar = measurementNoiseM ** 2;
-  const velVar = (MAX_PHYSICAL_SPEED_MS / 3) ** 2; // generous initial velocity uncertainty
-  return {
-    x: [enuX, enuY, vx, vy],
-    P: [
-      posVar, 0, 0, 0,
-      0, posVar, 0, 0,
-      0, 0, velVar, 0,
-      0, 0, 0, velVar,
-    ],
-    originLat,
-    originLon,
-    lastTimestamp: timestampMs,
-    lastActivityMs: Date.now(),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// PredictiveEngine
-// ---------------------------------------------------------------------------
-
-export class PredictiveEngine {
-  /**
-   * @param {object} [opts]
-   * @param {object|null} [opts.geofenceEngine]          Geofence engine (optional)
-   * @param {object|null} [opts.roomManager]             RoomManager (optional)
-   * @param {object}      [opts.config]                  Configuration overrides
-   * @param {boolean}     [opts.config.enable]
-   * @param {string}      [opts.config.model]            "CV" (default)
-   * @param {number}      [opts.config.processNoise]     acceleration σ (m/s²)
-   * @param {number}      [opts.config.measurementNoise] GPS position σ (m)
-   * @param {number}      [opts.config.preAlertHorizonS] seconds ahead to check fences
-   * @param {number}      [opts.config.maxHorizonS]      hard cap on prediction horizon
-   * @param {number}      [opts.config.ttlMs]            filter eviction TTL
-   */
-  constructor({ geofenceEngine = null, roomManager = null, config = {} } = {}) {
-    this._geofenceEngine = geofenceEngine;
-    this._roomManager = roomManager;
-
-    this._enable = config.enable ?? (process.env.PREDICTOR_ENABLE !== "false");
-    this._model = (config.model ?? process.env.PREDICTOR_MODEL ?? "CV").toUpperCase();
-    this._processNoise =
-      config.processNoise ?? Number(process.env.PREDICTOR_PROCESS_NOISE ?? 0.1);
-    this._measurementNoise =
-      config.measurementNoise ?? Number(process.env.PREDICTOR_MEASUREMENT_NOISE ?? 5.0);
-    this._preAlertHorizonS =
-      config.preAlertHorizonS ??
-      Number(process.env.PREDICTOR_PRE_ALERT_HORIZON_S ?? 60);
-    this._maxHorizonS =
-      config.maxHorizonS ?? Number(process.env.PREDICTOR_MAX_HORIZON_S ?? 120);
-    this._ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
-
-    /** @type {Map<string, FilterState>} */
-    this._filters = new Map();
-
-    /**
-     * Debounce map: Map<clientId, Map<fenceId, lastAlertMs>>
-     * @type {Map<string, Map<string, number>>}
-     */
-    this._preAlertDebounce = new Map();
-
-    /**
-     * Anomaly rate-limit: Map<clientId, Map<anomalyType, lastEmitMs>>
-     * @type {Map<string, Map<string, number>>}
-     */
-    this._anomalyTimes = new Map();
-
-    // Background eviction — run every 5 minutes
-    this._evictionInterval = setInterval(() => this._evict(), 5 * 60 * 1000);
-    // Allow the process to exit even if this interval remains
-    if (this._evictionInterval.unref) this._evictionInterval.unref();
+class KalmanFilterCV {
+  constructor(processNoise, measurementNoise) {
+    this.x = [0, 0, 0, 0];
+    this.P = [
+      [100, 0, 0, 0],
+      [0, 100, 0, 0],
+      [0, 0, 100, 0],
+      [0, 0, 0, 100],
+    ];
+    this.Q = this.createProcessNoise(processNoise);
+    this.R = [
+      [measurementNoise * measurementNoise, 0],
+      [0, measurementNoise * measurementNoise],
+    ];
+    this.initialized = false;
+    this.lastTimestamp = null;
+    this.originLat = null;
+    this.originLon = null;
   }
 
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
-
-  /**
-   * Ingest a location update, run the Kalman predict+update cycle,
-   * run anomaly detection, and return any anomaly flags.
-   *
-   * @param {string} clientId
-   * @param {object} location
-   * @param {number} location.latitude
-   * @param {number} location.longitude
-   * @param {number} [location.speed]     m/s (optional)
-   * @param {number} [location.heading]   degrees (optional)
-   * @param {string|number} [location.timestamp]  ISO string or ms epoch
-   * @returns {{ anomalies: string[] }}
-   */
-  update(clientId, location) {
-    if (!this._enable) return { anomalies: [] };
-
-    // Anomaly detection runs against the predicted current state (before the
-    // filter absorbs the new measurement) so genuine GPS faults are separable
-    // from ordinary vehicle motion.
-    const anomalies = this.detectAnomalies(clientId, location);
-
-    const ts = this._parseTimestamp(location.timestamp);
-    const lat = location.latitude;
-    const lon = location.longitude;
-
-    const existing = this._filters.get(clientId);
-
-    if (!existing) {
-      // First fix: initialise filter
-      const vx = location.speed != null && location.heading != null
-        ? location.speed * Math.sin(location.heading * DEG_TO_RAD)
-        : 0;
-      const vy = location.speed != null && location.heading != null
-        ? location.speed * Math.cos(location.heading * DEG_TO_RAD)
-        : 0;
-      const fs = initFilter(0, 0, vx, vy, lat, lon, ts, this._measurementNoise);
-      this._filters.set(clientId, fs);
-      return { anomalies };
-    }
-
-    // Re-origin if the vehicle has drifted too far from the ENU origin
-    const { x: curX, y: curY } = latLonToEnu(lat, lon, existing.originLat, existing.originLon);
-    if (enuDistance(0, 0, curX, curY) > ORIGIN_DRIFT_THRESHOLD_M) {
-      // Move the origin to the current filtered position (expressed in the old
-      // frame), then translate the state by the same offset. A change of
-      // origin is a pure translation, so velocity and covariance are unaffected.
-      const oldX = existing.x[0];
-      const oldY = existing.x[1];
-      const newPos = enuToLatLon(oldX, oldY, existing.originLat, existing.originLon);
-      existing.originLat = newPos.lat;
-      existing.originLon = newPos.lon;
-      existing.x[0] -= oldX;
-      existing.x[1] -= oldY;
-    }
-
-    const dtS = Math.max((ts - existing.lastTimestamp) / 1000, MIN_DT_S);
-
-    // ---- Predict ----
-    const F = buildF(dtS);
-    const Q = buildQ(dtS, this._processNoise);
-    existing.x = mat4MulVec(F, existing.x);
-    existing.P = mat4Add(mat4Mul(mat4Mul(F, existing.P), mat4T(F)), Q);
-
-    // ---- Update ----
-    const { x: measX, y: measY } = latLonToEnu(lat, lon, existing.originLat, existing.originLon);
-    const z = [measX, measY];
-    const hx = mulHx(existing.x);
-    const innovation = [z[0] - hx[0], z[1] - hx[1]];
-    const r = this._measurementNoise ** 2;
-    const S = computeS(existing.P, r);
-    const K = computeK(existing.P, S);
-
-    if (K) {
-      existing.x = applyKx(existing.x, K, innovation);
-      existing.P = josephUpdate(existing.P, K, r);
-    }
-
-    existing.lastTimestamp = ts;
-    existing.lastActivityMs = Date.now();
-
-    return { anomalies };
+  createProcessNoise(q) {
+    return [
+      [q, 0, 0, 0],
+      [0, q, 0, 0],
+      [0, 0, q, 0],
+      [0, 0, 0, q],
+    ];
   }
 
-  /**
-   * Returns predicted positions at each horizon (seconds from now).
-   *
-   * @param {string}   clientId
-   * @param {number[]} horizons  seconds, e.g. [10, 30, 60]
-   * @returns {Array<{horizon:number, lat:number, lon:number, speed:number, heading:number, confidenceEllipse:{semiMajorM:number,semiMinorM:number,orientationRad:number}}>}
-   */
-  getTrajectory(clientId, horizons = [10, 30, 60]) {
-    if (!this._enable) return [];
-    const fs = this._filters.get(clientId);
-    if (!fs) return [];
-
-    return horizons
-      .filter((h) => h > 0 && h <= this._maxHorizonS)
-      .map((h) => {
-        const { x, P } = this._predictAt(fs, h);
-        const { lat, lon } = enuToLatLon(x[0], x[1], fs.originLat, fs.originLon);
-        const speed = Math.sqrt(x[2] ** 2 + x[3] ** 2);
-        const heading = (Math.atan2(x[2], x[3]) * RAD_TO_DEG + 360) % 360;
-        const posP = [P[0], P[1], P[4], P[5]]; // 2×2 position sub-matrix
-        const { lambda1, lambda2 } = sym2Eigen(posP);
-        const orientationRad = sym2Angle(posP);
-        return {
-          horizon: h,
-          lat,
-          lon,
-          speed,
-          heading,
-          confidenceEllipse: {
-            semiMajorM: Math.sqrt(Math.max(0, lambda1)),
-            semiMinorM: Math.sqrt(Math.max(0, lambda2)),
-            orientationRad,
-          },
-        };
-      });
+  initialize(lat, lon, timestamp) {
+    this.originLat = lat;
+    this.originLon = lon;
+    this.lastTimestamp = timestamp;
+    this.initialized = true;
   }
 
-  /**
-   * Compute ETA to a target location.
-   *
-   * @param {string} clientId
-   * @param {number} targetLat
-   * @param {number} targetLon
-   * @returns {{ etaMean: number|null, etaStdDev: number|null, reachable: boolean }}
-   *   etaMean and etaStdDev are in seconds; null means not reachable within maxHorizon.
-   */
-  getETA(clientId, targetLat, targetLon) {
-    if (!this._enable) return { etaMean: null, etaStdDev: null, reachable: false };
-    const fs = this._filters.get(clientId);
-    if (!fs) return { etaMean: null, etaStdDev: null, reachable: false };
+  predict(dt) {
+    const F = [
+      [1, 0, dt, 0],
+      [0, 1, 0, dt],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ];
+    this.x = this.matVecMul(F, this.x);
+    this.P = this.matAdd(this.matMul(this.matMul(F, this.P), this.transpose(F)), this.Q);
+  }
 
-    const { x: tgtX, y: tgtY } = latLonToEnu(targetLat, targetLon, fs.originLat, fs.originLon);
+  update(z, timestamp) {
+    if (!this.initialized) return { innovation: [0, 0], innovationCov: [[0, 0], [0, 0]] };
 
-    // Sample trajectory at fine intervals and find crossing
-    const step = 1; // 1-second resolution
-    let etaMean = null;
-    let etaStdDevAccum = null;
-
-    for (let t = step; t <= this._maxHorizonS; t += step) {
-      const { x, P } = this._predictAt(fs, t);
-      const dist = enuDistance(x[0], x[1], tgtX, tgtY);
-      const posUncert = Math.sqrt(Math.max(0, P[0] + P[5])); // sqrt(trace of 2x2 pos)
-      if (dist <= posUncert + 1) {
-        // Within 1σ position uncertainty + 1m tolerance
-        etaMean = t;
-        etaStdDevAccum = posUncert / Math.max(this._currentSpeed(fs), 0.1);
-        break;
-      }
+    if (this.lastTimestamp !== null) {
+      const dt = (timestamp - this.lastTimestamp) / 1000;
+      if (dt > 0) this.predict(dt);
     }
+    this.lastTimestamp = timestamp;
 
-    if (etaMean === null) {
-      // Extrapolate rough ETA from current speed and distance
-      const distNow = enuDistance(fs.x[0], fs.x[1], tgtX, tgtY);
-      const speed = this._currentSpeed(fs);
-      if (speed > 0.5) {
-        const roughEta = distNow / speed;
-        if (roughEta <= this._maxHorizonS) {
-          etaMean = roughEta;
-          etaStdDevAccum = roughEta * 0.2; // rough 20% uncertainty
-        }
-      }
-    }
+    const H = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+    ];
 
+    const Hx = [this.x[0], this.x[1]];
+    const y = [z[0] - Hx[0], z[1] - Hx[1]];
+
+    const HPHt = this.matMul(this.matMul(H, this.P), this.transpose(H));
+    const S = this.matAdd(HPHt, this.R);
+
+    const Sinv = this.inv2x2(S);
+    const PHt = this.matMul(this.P, this.transpose(H));
+    const K = this.matMul(PHt, Sinv);
+
+    const Ky = this.matVecMul(K, y);
+    this.x = [this.x[0] + Ky[0], this.x[1] + Ky[1], this.x[2] + Ky[2], this.x[3] + Ky[3]];
+
+    const I = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ];
+    const KH = this.matMul(K, H);
+    const IminusKH = this.matSub(I, KH);
+    const IminusKHP = this.matMul(IminusKH, this.P);
+    const IminusKHP_IminusKHt = this.matMul(IminusKHP, this.transpose(IminusKH));
+    const KRKt = this.matMul(this.matMul(K, this.R), this.transpose(K));
+    this.P = this.matAdd(IminusKHP_IminusKHt, KRKt);
+
+    return { innovation: y, innovationCov: S };
+  }
+
+  predictState(dt) {
+    const F = [
+      [1, 0, dt, 0],
+      [0, 1, 0, dt],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ];
+    const xPred = this.matVecMul(F, this.x);
+    const PPred = this.matAdd(this.matMul(this.matMul(F, this.P), this.transpose(F)), this.Q);
+    return { x: xPred, P: PPred };
+  }
+
+  getState() {
     return {
-      etaMean,
-      etaStdDev: etaStdDevAccum,
-      reachable: etaMean !== null,
+      x: this.x[0],
+      y: this.x[1],
+      vx: this.x[2],
+      vy: this.x[3],
+      speed: Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]),
+      heading: Math.atan2(this.x[3], this.x[2]),
+      covariance: this.P,
     };
   }
 
-  /**
-   * Evaluate the predicted trajectory against geofences and emit pre-alerts via
-   * the room manager for clients in any room.
-   *
-   * @param {string} clientId
-   * @returns {Array<{fenceId:string,predictedEntryTime:number,predictedEntryPoint:{lat:number,lon:number},confidence:number}>}
-   */
-  checkPreAlerts(clientId) {
-    if (!this._enable) return [];
-    if (!this._geofenceEngine) return [];
-    const fs = this._filters.get(clientId);
-    if (!fs) return [];
+  getPositionCovariance() {
+    return [
+      [this.P[0][0], this.P[0][1]],
+      [this.P[1][0], this.P[1][1]],
+    ];
+  }
 
-    const alerts = [];
-    const now = Date.now();
-    const debounce = this._preAlertDebounce.get(clientId) ?? new Map();
+  setState(x, P) {
+    this.x = x;
+    this.P = P;
+  }
 
-    const horizonS = Math.min(this._preAlertHorizonS, this._maxHorizonS);
-    for (let t = TRAJECTORY_SAMPLE_INTERVAL_S; t <= horizonS; t += TRAJECTORY_SAMPLE_INTERVAL_S) {
-      const { x, P } = this._predictAt(fs, t);
-      const { lat, lon } = enuToLatLon(x[0], x[1], fs.originLat, fs.originLon);
-
-      let fenceHits;
-      try {
-        fenceHits = this._geofenceEngine.checkPoint?.(lat, lon) ??
-          this._geofenceEngine.check?.(lat, lon) ?? [];
-      } catch {
-        fenceHits = [];
+  matMul(A, B) {
+    const rowsA = A.length;
+    const colsA = A[0].length;
+    const colsB = B[0].length;
+    const result = Array(rowsA).fill(null).map(() => Array(colsB).fill(0));
+    for (let i = 0; i < rowsA; i++) {
+      for (let j = 0; j < colsB; j++) {
+        let sum = 0;
+        for (let k = 0; k < colsA; k++) {
+          sum += A[i][k] * B[k][j];
+        }
+        result[i][j] = sum;
       }
+    }
+    return result;
+  }
 
-      for (const fence of fenceHits) {
-        const fenceId = fence.id ?? fence.fenceId ?? String(fence);
-        const fenceName = fence.name ?? fence.fenceName ?? fenceId;
-        const lastAlert = debounce.get(fenceId) ?? 0;
-        if (now - lastAlert < PRE_ALERT_DEBOUNCE_MS) continue;
+  matVecMul(A, v) {
+    const rows = A.length;
+    const cols = A[0].length;
+    const result = Array(rows).fill(0);
+    for (let i = 0; i < rows; i++) {
+      let sum = 0;
+      for (let j = 0; j < cols; j++) {
+        sum += A[i][j] * v[j];
+      }
+      result[i] = sum;
+    }
+    return result;
+  }
 
-        debounce.set(fenceId, now);
-        const posVar = Math.max(0, P[0] + P[5]);
-        const confidence = Math.exp(-0.5 * posVar / (this._measurementNoise ** 2));
+  matAdd(A, B) {
+    const rows = A.length;
+    const cols = A[0].length;
+    const result = Array(rows).fill(null).map(() => Array(cols).fill(0));
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        result[i][j] = A[i][j] + B[i][j];
+      }
+    }
+    return result;
+  }
 
-        const alert = {
-          fenceId,
-          fenceName,
-          predictedEntryTime: now + t * 1000,
-          predictedEntryPoint: { lat, lon },
-          confidence: Math.max(0, Math.min(1, confidence)),
-        };
-        alerts.push(alert);
+  matSub(A, B) {
+    const rows = A.length;
+    const cols = A[0].length;
+    const result = Array(rows).fill(null).map(() => Array(cols).fill(0));
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        result[i][j] = A[i][j] - B[i][j];
+      }
+    }
+    return result;
+  }
 
-        // Broadcast to all rooms the client is in
-        this._broadcastEvent(clientId, "geofence_pre_alert", alert);
+  transpose(A) {
+    const rows = A.length;
+    const cols = A[0].length;
+    const result = Array(cols).fill(null).map(() => Array(rows).fill(0));
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        result[j][i] = A[i][j];
+      }
+    }
+    return result;
+  }
+
+  inv2x2(M) {
+    const a = M[0][0], b = M[0][1], c = M[1][0], d = M[1][1];
+    const det = a * d - b * c;
+    if (Math.abs(det) < 1e-12) {
+      return [[1e12, 0], [0, 1e12]];
+    }
+    return [[d / det, -b / det], [-c / det, a / det]];
+  }
+
+  eigenvalues2x2(M) {
+    const a = M[0][0], b = M[0][1], c = M[1][0], d = M[1][1];
+    const trace = a + d;
+    const det = a * d - b * c;
+    const discriminant = trace * trace - 4 * det;
+    if (discriminant < 0) return [trace / 2, trace / 2];
+    const sqrtDisc = Math.sqrt(discriminant);
+    const lambda1 = (trace + sqrtDisc) / 2;
+    const lambda2 = (trace - sqrtDisc) / 2;
+    return [lambda1, lambda2];
+  }
+
+  confidenceEllipse() {
+    const Ppos = this.getPositionCovariance();
+    const eig = this.eigenvalues2x2(Ppos);
+    const a = Math.sqrt(Math.max(0, eig[0]));
+    const b = Math.sqrt(Math.max(0, eig[1]));
+    const angle = 0.5 * Math.atan2(2 * Ppos[0][1], Ppos[0][0] - Ppos[1][1]);
+    return { semiMajor: a, semiMinor: b, orientation: angle };
+  }
+
+  shouldReorigin(lat, lon) {
+    if (this.originLat === null || this.originLon === null) return false;
+    const { x, y } = latLonToEnu(lat, lon, this.originLat, this.originLon);
+    const dist = Math.sqrt(x * x + y * y);
+    return dist > 50000;
+  }
+
+  reorigin(lat, lon) {
+    const { x, y } = latLonToEnu(lat, lon, this.originLat, this.originLon);
+    this.x[0] = x;
+    this.x[1] = y;
+    this.originLat = lat;
+    this.originLon = lon;
+  }
+}
+
+class ClientFilter {
+  constructor(config) {
+    this.config = config;
+    this.filter = new KalmanFilterCV(config.PREDICTOR_PROCESS_NOISE, config.PREDICTOR_MEASUREMENT_NOISE);
+    this.lastLocation = null;
+    this.lastUpdateTime = null;
+    this.preAlertDebounce = new Map();
+    this.anomalyRateLimit = new Map();
+    this.predictedPositions = [];
+  }
+
+  update(location) {
+    const { latitude, longitude, speed, heading, timestamp } = location;
+    const ts = timestamp ? Date.parse(timestamp) : Date.now();
+
+    if (!this.filter.initialized) {
+      this.filter.initialize(latitude, longitude, ts);
+      const enu = latLonToEnu(latitude, longitude, this.filter.originLat, this.filter.originLon);
+      this.filter.x[0] = enu.x;
+      this.filter.x[1] = enu.y;
+      if (speed !== undefined && heading !== undefined) {
+        this.filter.x[2] = speed * Math.cos(heading);
+        this.filter.x[3] = speed * Math.sin(heading);
+      }
+      this.lastLocation = { latitude, longitude, speed, heading, timestamp: ts };
+      this.lastUpdateTime = ts;
+      return { innovation: [0, 0], innovationCov: [[0, 0], [0, 0]], anomalies: [] };
+    }
+
+    if (this.filter.shouldReorigin(latitude, longitude)) {
+      this.filter.reorigin(latitude, longitude);
+    }
+
+    const enu = latLonToEnu(latitude, longitude, this.filter.originLat, this.filter.originLon);
+    const result = this.filter.update([enu.x, enu.y], ts);
+
+    const anomalies = this.detectAnomalies(location, result, ts);
+
+    this.lastLocation = { latitude, longitude, speed, heading, timestamp: ts };
+    this.lastUpdateTime = ts;
+
+    return { ...result, anomalies };
+  }
+
+  detectAnomalies(location, filterResult, timestamp) {
+    const anomalies = [];
+    const now = Date.now();
+    const clientId = this.clientId;
+
+    const { innovation, innovationCov } = filterResult;
+    const sigmaX = Math.sqrt(innovationCov[0][0]);
+    const sigmaY = Math.sqrt(innovationCov[1][1]);
+    const innovationNorm = Math.sqrt(innovation[0] * innovation[0] + innovation[1] * innovation[1]);
+    const sigmaNorm = Math.sqrt(sigmaX * sigmaX + sigmaY * sigmaY);
+
+    if (innovationNorm > this.config.PREDICTOR_ANOMALY_INNOVATION_SIGMA * sigmaNorm) {
+      if (this.canEmitAnomaly(clientId, "gps_anomaly", now)) {
+        anomalies.push({ type: "gps_anomaly", severity: "warning", innovation: innovationNorm, threshold: this.config.PREDICTOR_ANOMALY_INNOVATION_SIGMA * sigmaNorm });
       }
     }
 
-    this._preAlertDebounce.set(clientId, debounce);
-    return alerts;
-  }
-
-  /**
-   * Detect measurement and kinematic anomalies for an incoming location.
-   * Does NOT modify filter state — the innovation is computed against the
-   * filter state propagated to the measurement timestamp, so ordinary motion
-   * is not mistaken for a GPS fault.
-   *
-   * @param {string} clientId
-   * @param {object} location
-   * @returns {string[]}  e.g. ["gps_anomaly", "kinematic_anomaly"]
-   */
-  detectAnomalies(clientId, location) {
-    if (!this._enable) return [];
-    const anomalies = [];
-    const fs = this._filters.get(clientId);
-    const now = Date.now();
-
-    if (fs) {
-      const ts = this._parseTimestamp(location.timestamp);
-      const dtS = Math.max((ts - fs.lastTimestamp) / 1000, MIN_DT_S);
-
-      // Propagate the filter forward without mutating it.
-      const { x: predX, P: predP } = this._predictAt(fs, dtS);
-      const { x: measX, y: measY } = latLonToEnu(
-        location.latitude,
-        location.longitude,
-        fs.originLat,
-        fs.originLon,
-      );
-      const hx = mulHx(predX);
-      const innovation = [measX - hx[0], measY - hx[1]];
-      const r = this._measurementNoise ** 2;
-      const S = computeS(predP, r);
-      const innovMag = Math.sqrt(innovation[0] ** 2 + innovation[1] ** 2);
-      const Sdiag = Math.sqrt(Math.max(S[0], 0) + Math.max(S[3], 0));
-      if (innovMag > ANOMALY_SIGMA * Sdiag && Sdiag > 0) {
-        if (this._rateAllow(clientId, "gps_anomaly", now)) {
-          anomalies.push("gps_anomaly");
-        }
-      }
-
-      // Kinematic: impossible acceleration or heading change
-      if (location.speed != null) {
-        const currentSpeed = this._currentSpeed(fs);
-        const dvdt = Math.abs(location.speed - currentSpeed) / dtS;
-        if (dvdt > MAX_PHYSICAL_ACCEL_MS2) {
-          if (this._rateAllow(clientId, "kinematic_anomaly", now)) {
-            anomalies.push("kinematic_anomaly");
+    if (this.lastLocation && location.speed !== undefined && this.lastLocation.speed !== undefined) {
+      const dt = (timestamp - this.lastUpdateTime) / 1000;
+      if (dt > 0) {
+        const accel = Math.abs(location.speed - this.lastLocation.speed) / dt;
+        if (accel > this.config.PREDICTOR_ANOMALY_MAX_ACCELERATION) {
+          if (this.canEmitAnomaly(clientId, "kinematic_anomaly", now)) {
+            anomalies.push({ type: "kinematic_anomaly", severity: "warning", acceleration: accel, threshold: this.config.PREDICTOR_ANOMALY_MAX_ACCELERATION });
           }
         }
       }
+    }
 
-      if (location.heading != null) {
-        const predictedHeading = (Math.atan2(predX[2], predX[3]) * RAD_TO_DEG + 360) % 360;
-        const headingDelta = Math.abs(location.heading - predictedHeading);
-        const headingDeltaRad = Math.min(headingDelta, 360 - headingDelta) * DEG_TO_RAD;
-        const headingRate = headingDeltaRad / dtS;
-        if (headingRate > MAX_PHYSICAL_HEADING_RATE && dtS > 1) {
-          if (!anomalies.includes("kinematic_anomaly")) {
-            if (this._rateAllow(clientId, "kinematic_anomaly", now)) {
-              anomalies.push("kinematic_anomaly");
-            }
+    if (this.lastLocation && location.heading !== undefined && this.lastLocation.heading !== undefined) {
+      const dt = (timestamp - this.lastUpdateTime) / 1000;
+      if (dt > 0) {
+        let headingDiff = location.heading - this.lastLocation.heading;
+        headingDiff = ((headingDiff + Math.PI) % (2 * Math.PI)) - Math.PI;
+        const headingRate = Math.abs(headingDiff) / dt;
+        if (headingRate > this.config.PREDICTOR_ANOMALY_MAX_HEADING_RATE) {
+          if (this.canEmitAnomaly(clientId, "kinematic_anomaly", now)) {
+            anomalies.push({ type: "kinematic_anomaly", severity: "warning", headingRate, threshold: this.config.PREDICTOR_ANOMALY_MAX_HEADING_RATE });
           }
         }
       }
@@ -804,141 +384,261 @@ export class PredictiveEngine {
     return anomalies;
   }
 
-  /**
-   * Explicitly remove a client's filter state (call on disconnect).
-   * @param {string} clientId
-   */
-  removeClient(clientId) {
-    this._filters.delete(clientId);
-    this._preAlertDebounce.delete(clientId);
-    this._anomalyTimes.delete(clientId);
+  canEmitAnomaly(clientId, type, now) {
+    const key = `${clientId}:${type}`;
+    const lastEmit = this.anomalyRateLimit.get(key) || 0;
+    if (now - lastEmit >= this.config.PREDICTOR_ANOMALY_RATE_LIMIT_MS) {
+      this.anomalyRateLimit.set(key, now);
+      return true;
+    }
+    return false;
   }
 
-  /**
-   * Serialise a client's filter state for session resumption.
-   * @param {string} clientId
-   * @returns {object|null}
-   */
-  serializeState(clientId) {
-    const fs = this._filters.get(clientId);
-    if (!fs) return null;
+  getTrajectory(horizons) {
+    const results = [];
+    const { originLat, originLon } = this.filter;
+
+    for (const horizon of horizons) {
+      if (horizon > this.config.PREDICTOR_MAX_HORIZON_S) continue;
+      const pred = this.filter.predictState(horizon);
+      const { x, y } = { x: pred.x[0], y: pred.x[1] };
+      const { lat, lon } = enuToLatLon(x, y, originLat, originLon);
+      const speed = Math.sqrt(pred.x[2] * pred.x[2] + pred.x[3] * pred.x[3]);
+      const heading = Math.atan2(pred.x[3], pred.x[2]);
+      const posCov = [
+        [pred.P[0][0], pred.P[0][1]],
+        [pred.P[1][0], pred.P[1][1]],
+      ];
+      const eig = this.filter.eigenvalues2x2(posCov);
+      const semiMajor = Math.sqrt(Math.max(0, eig[0]));
+      const semiMinor = Math.sqrt(Math.max(0, eig[1]));
+      const orientation = 0.5 * Math.atan2(2 * posCov[0][1], posCov[0][0] - posCov[1][1]);
+      results.push({
+        horizon,
+        lat,
+        lon,
+        speed,
+        heading,
+        confidenceEllipse: { semiMajor, semiMinor, orientation },
+      });
+    }
+    return results;
+  }
+
+  getETA(targetLat, targetLon) {
+    const state = this.filter.getState();
+    const { originLat, originLon } = this.filter;
+    const targetEnu = latLonToEnu(targetLat, targetLon, originLat, originLon);
+    const dx = targetEnu.x - state.x;
+    const dy = targetEnu.y - state.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    const speed = state.speed;
+    if (speed < 0.1) {
+      return { etaMean: null, etaStdDev: null, arrivalProbabilityAt: () => 0 };
+    }
+    const etaMean = distance / speed;
+    const posCov = this.filter.getPositionCovariance();
+    const alongTrackVar = (dx * dx * posCov[0][0] + 2 * dx * dy * posCov[0][1] + dy * dy * posCov[1][1]) / (distance * distance);
+    const etaStdDev = Math.sqrt(alongTrackVar) / speed;
     return {
-      x: [...fs.x],
-      P: [...fs.P],
-      originLat: fs.originLat,
-      originLon: fs.originLon,
-      lastTimestamp: fs.lastTimestamp,
+      etaMean,
+      etaStdDev,
+      arrivalProbabilityAt: (t) => {
+        const z = (t - etaMean) / etaStdDev;
+        return 0.5 * (1 + this.erf(z / Math.sqrt(2)));
+      },
     };
   }
 
-  /**
-   * Restore a client's filter state from a session resumption blob.
-   * @param {string} clientId
-   * @param {object} state  (as returned by serializeState)
-   */
-  restoreState(clientId, state) {
-    if (!state || !Array.isArray(state.x) || state.x.length !== 4) return;
-    this._filters.set(clientId, {
-      x: [...state.x],
-      P: Array.isArray(state.P) && state.P.length === 16 ? [...state.P] : mat4Identity(),
-      originLat: state.originLat,
-      originLon: state.originLon,
-      lastTimestamp: state.lastTimestamp ?? Date.now(),
-      lastActivityMs: Date.now(),
-    });
+  erf(x) {
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429;
+    const p = 0.3275911;
+    const sign = x < 0 ? -1 : 1;
+    x = Math.abs(x);
+    const t = 1 / (1 + p * x);
+    const y = 1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+    return sign * y;
   }
 
-  /**
-   * Stop background intervals.
-   */
-  close() {
-    clearInterval(this._evictionInterval);
-  }
+  checkPreAlerts(geofenceEngine) {
+    if (!geofenceEngine) return [];
+    const alerts = [];
+    const horizons = [10, 20, 30, 40, 50, 60].filter(h => h <= this.config.PREDICTOR_PRE_ALERT_HORIZON_S);
 
-  // -------------------------------------------------------------------------
-  // Private helpers
-  // -------------------------------------------------------------------------
+    for (const horizon of horizons) {
+      const pred = this.filter.predictState(horizon);
+      const { x, y } = { x: pred.x[0], y: pred.x[1] };
+      const { lat, lon } = enuToLatLon(x, y, this.filter.originLat, this.filter.originLon);
+      const predictedTime = Date.now() + horizon * 1000;
 
-  /**
-   * Predict filter state dt seconds ahead without mutating it.
-   * @param {FilterState} fs
-   * @param {number}      dtS
-   * @returns {{ x: number[], P: number[] }}
-   */
-  _predictAt(fs, dtS) {
-    const F = buildF(dtS);
-    const Q = buildQ(dtS, this._processNoise);
-    const x = mat4MulVec(F, fs.x);
-    const P = mat4Add(mat4Mul(mat4Mul(F, fs.P), mat4T(F)), Q);
-    return { x, P };
-  }
-
-  /**
-   * Current speed estimate from the filter state.
-   * @param {FilterState} fs
-   * @returns {number}  m/s
-   */
-  _currentSpeed(fs) {
-    return Math.sqrt(fs.x[2] ** 2 + fs.x[3] ** 2);
-  }
-
-  /**
-   * Parse a timestamp value to milliseconds since epoch.
-   * @param {string|number|undefined} ts
-   * @returns {number}
-   */
-  _parseTimestamp(ts) {
-    if (ts == null) return Date.now();
-    if (typeof ts === "number") return ts;
-    const parsed = Date.parse(ts);
-    return Number.isNaN(parsed) ? Date.now() : parsed;
-  }
-
-  /**
-   * Check and record anomaly rate limit.
-   * @param {string} clientId
-   * @param {string} anomalyType
-   * @param {number} now
-   * @returns {boolean}  true if allowed to emit
-   */
-  _rateAllow(clientId, anomalyType, now) {
-    if (!this._anomalyTimes.has(clientId)) this._anomalyTimes.set(clientId, new Map());
-    const map = this._anomalyTimes.get(clientId);
-    const last = map.get(anomalyType) ?? 0;
-    if (now - last < ANOMALY_RATE_LIMIT_MS) return false;
-    map.set(anomalyType, now);
-    return true;
-  }
-
-  /**
-   * Broadcast a predictive event to all rooms the client occupies.
-   * @param {string} clientId
-   * @param {string} type
-   * @param {object} payload
-   */
-  _broadcastEvent(clientId, type, payload) {
-    if (!this._roomManager) return;
-    try {
-      const roomIds = this._roomManager.getClientRooms?.(clientId);
-      if (!roomIds) return;
-      for (const roomId of roomIds) {
-        this._roomManager.broadcast(roomId, { type, payload }, clientId);
-      }
-    } catch (err) {
-      logger.warn("predictor: broadcast error", { clientId, type, error: err.message });
-    }
-  }
-
-  /**
-   * Evict filter states that haven't been updated within the TTL.
-   */
-  _evict() {
-    const now = Date.now();
-    for (const [clientId, fs] of this._filters) {
-      if (now - fs.lastActivityMs > this._ttlMs) {
-        this.removeClient(clientId);
-        logger.debug("predictor: evicted stale filter", { clientId });
+      const fences = geofenceEngine.getFencesForPoint?.(lat, lon) || [];
+      for (const fence of fences) {
+        const key = `${this.clientId}:${fence.fenceId}`;
+        if (this.preAlertDebounce.has(key)) continue;
+        const inside = geofenceEngine.isPointInside?.(fence.fenceId, lat, lon);
+        if (inside) {
+          this.preAlertDebounce.set(key, true);
+          alerts.push({
+            type: "geofence_pre_alert",
+            fenceId: fence.fenceId,
+            fenceName: fence.name,
+            predictedEntryTime: predictedTime,
+            predictedEntryPoint: { lat, lon },
+            confidence: 1 - Math.min(1, horizon / this.config.PREDICTOR_PRE_ALERT_HORIZON_S),
+          });
+        }
       }
     }
+    return alerts;
+  }
+
+  getStateForPersistence() {
+    return {
+      filterState: {
+        x: this.filter.x,
+        P: this.filter.P,
+        initialized: this.filter.initialized,
+        originLat: this.filter.originLat,
+        originLon: this.filter.originLon,
+        lastTimestamp: this.filter.lastTimestamp,
+      },
+      lastLocation: this.lastLocation,
+      lastUpdateTime: this.lastUpdateTime,
+    };
+  }
+
+  restoreState(state) {
+    if (!state || !state.filterState) return;
+    const { filterState } = state;
+    this.filter.x = filterState.x;
+    this.filter.P = filterState.P;
+    this.filter.initialized = filterState.initialized;
+    this.filter.originLat = filterState.originLat;
+    this.filter.originLon = filterState.originLon;
+    this.filter.lastTimestamp = filterState.lastTimestamp;
+    this.lastLocation = state.lastLocation;
+    this.lastUpdateTime = state.lastUpdateTime;
   }
 }
+
+export class PredictiveEngine {
+  constructor({ geofenceEngine, roomManager, config: userConfig = {} }) {
+    this.geofenceEngine = geofenceEngine;
+    this.roomManager = roomManager;
+    this.config = { ...DEFAULT_CONFIG, ...parseConfig(), ...userConfig };
+    this.filters = new Map();
+    this.cleanupInterval = setInterval(() => this.cleanup(), 300000);
+    this.cleanupInterval.unref();
+  }
+
+  update(clientId, location) {
+    if (!this.config.PREDICTOR_ENABLE) return { anomalies: [] };
+
+    let clientFilter = this.filters.get(clientId);
+    if (!clientFilter) {
+      clientFilter = new ClientFilter(this.config);
+      clientFilter.clientId = clientId;
+      this.filters.set(clientId, clientFilter);
+    }
+    return clientFilter.update(location);
+  }
+
+  getTrajectory(clientId, horizons = [10, 30, 60]) {
+    const clientFilter = this.filters.get(clientId);
+    if (!clientFilter || !clientFilter.filter.initialized) return [];
+    return clientFilter.getTrajectory(horizons);
+  }
+
+  getETA(clientId, targetLat, targetLon) {
+    const clientFilter = this.filters.get(clientId);
+    if (!clientFilter || !clientFilter.filter.initialized) {
+      return { etaMean: null, etaStdDev: null, arrivalProbabilityAt: () => 0 };
+    }
+    return clientFilter.getETA(targetLat, targetLon);
+  }
+
+  checkPreAlerts(clientId) {
+    const clientFilter = this.filters.get(clientId);
+    if (!clientFilter || !clientFilter.filter.initialized) return [];
+    const alerts = clientFilter.checkPreAlerts(this.geofenceEngine);
+    for (const alert of alerts) {
+      this.broadcastPreAlert(clientId, alert);
+    }
+    return alerts;
+  }
+
+  detectAnomalies(clientId, location) {
+    const clientFilter = this.filters.get(clientId);
+    if (!clientFilter) return [];
+    return clientFilter.detectAnomalies(location, { innovation: [0, 0], innovationCov: [[0, 0], [0, 0]] }, Date.now());
+  }
+
+  broadcastPreAlert(clientId, alert) {
+    if (!this.roomManager) return;
+    const rooms = this.roomManager.getClientRooms(clientId);
+    for (const roomId of rooms) {
+      this.roomManager.broadcast(roomId, {
+        type: "geofence_pre_alert",
+        payload: { clientId, ...alert },
+      }, clientId);
+    }
+  }
+
+  broadcastAnomaly(clientId, anomaly) {
+    if (!this.roomManager) return;
+    const rooms = this.roomManager.getClientRooms(clientId);
+    for (const roomId of rooms) {
+      this.roomManager.broadcast(roomId, {
+        type: "gps_anomaly",
+        payload: { clientId, ...anomaly },
+      }, clientId);
+    }
+  }
+
+  broadcastETAUpdate(clientId, eta) {
+    if (!this.roomManager) return;
+    const rooms = this.roomManager.getClientRooms(clientId);
+    for (const roomId of rooms) {
+      this.roomManager.broadcast(roomId, {
+        type: "eta_update",
+        payload: { clientId, ...eta },
+      }, clientId);
+    }
+  }
+
+  getClientState(clientId) {
+    const clientFilter = this.filters.get(clientId);
+    if (!clientFilter) return null;
+    return clientFilter.getStateForPersistence();
+  }
+
+  restoreClientState(clientId, state) {
+    let clientFilter = this.filters.get(clientId);
+    if (!clientFilter) {
+      clientFilter = new ClientFilter(this.config);
+      clientFilter.clientId = clientId;
+      this.filters.set(clientId, clientFilter);
+    }
+    clientFilter.restoreState(state);
+  }
+
+  removeClient(clientId) {
+    this.filters.delete(clientId);
+  }
+
+  cleanup() {
+    const now = Date.now();
+    for (const [clientId, clientFilter] of this.filters) {
+      if (clientFilter.lastUpdateTime && now - clientFilter.lastUpdateTime > this.config.PREDICTOR_TTL_MS) {
+        this.filters.delete(clientId);
+      }
+    }
+  }
+
+  close() {
+    clearInterval(this.cleanupInterval);
+    this.filters.clear();
+  }
+}
+
+export { latLonToEnu, enuToLatLon, distanceEnu };
