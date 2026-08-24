@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomBytes } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { URL } from "node:url";
 import { v4 as uuid } from "uuid";
@@ -208,6 +209,10 @@ export function createServer({
   });
   const rateLimiter = createRateLimiter(maxMessagesPerSecond);
   const connRateLimiter = createConnRateLimiter(connRateLimit);
+  const predictor = new PredictiveEngine({
+    geofenceEngine: null,
+    roomManager: rooms,
+  });
   const ipConnectionCount = new Map();
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
   const MAX_MESSAGES_PER_SECOND =
@@ -328,10 +333,10 @@ export function createServer({
    * @param {object|null} ctx
    */
   function touchSession(ctx) {
-    if (!sessions || !ctx) return;
+    if (!sessionManager || !ctx) return;
     ctx.lastActivityAt = Date.now();
     rememberLocal(ctx.clientId, captureState(ctx));
-    sessions.debouncedSave(ctx.clientId, () => captureState(ctx)).catch((err) => {
+    sessionManager.debouncedSave(ctx.clientId, () => captureState(ctx)).catch((err) => {
       logger.error("Failed to schedule session save", { clientId: ctx.clientId, error: err.message });
     });
   }
@@ -403,7 +408,7 @@ export function createServer({
     if (sessionId) {
       // `load()` counts decrypt_failed / expired; success is recorded here,
       // after the identity check, so a mismatch is not also a success.
-      const state = await sessions.load(sessionId, { countSuccess: false });
+      const state = await sessionManager.load(sessionId, { countSuccess: false });
       if (!state) {
         logger.info("Session not resumable", { clientId: ctx.clientId });
         return false;
@@ -442,12 +447,12 @@ export function createServer({
    * @returns {Promise<string|null>} The blob, or null when the client is unknown.
    */
   async function migrateClient(clientId) {
-    const ctx = sessions ? liveClients.get(clientId) : null;
+    const ctx = sessionManager ? liveClients.get(clientId) : null;
     if (!ctx) return null;
 
-    await sessions.flush(clientId);
+    await sessionManager.flush(clientId);
     const state = captureState(ctx);
-    const blob = await sessions.save(clientId, state);
+    const blob = await sessionManager.save(clientId, state);
     rememberLocal(clientId, state);
 
     if (Buffer.byteLength(blob, "utf8") <= MAX_CLOSE_REASON_BYTES) {
@@ -468,14 +473,14 @@ export function createServer({
   async function _saveAllSessions() {
     /** @type {Map<string, string>} */
     const blobs = new Map();
-    if (!sessions) return blobs;
+    if (!sessionManager) return blobs;
 
-    await sessions.flushAll();
+    await sessionManager.flushAll();
     for (const ctx of liveClients.values()) {
       const state = captureState(ctx);
       rememberLocal(ctx.clientId, state);
       try {
-        blobs.set(ctx.clientId, await sessions.save(ctx.clientId, state));
+        blobs.set(ctx.clientId, await sessionManager.save(ctx.clientId, state));
       } catch (err) {
         logger.error("Failed to save session", { clientId: ctx.clientId, error: err.message });
       }
@@ -483,7 +488,7 @@ export function createServer({
     return blobs;
   }
 
-  if (sessions) {
+  if (sessionManager) {
     wss.on("headers", (headers) => {
       headers.push(
         `Set-Cookie: ${AFFINITY_COOKIE}=${resolvedInstanceId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${AFFINITY_MAX_AGE_S}`
@@ -745,6 +750,28 @@ export function createServer({
           }
           case "location_update": {
             metrics.messages.location_update++;
+            const location = {
+              latitude: msg.payload.latitude,
+              longitude: msg.payload.longitude,
+              altitude: msg.payload.altitude,
+              accuracy: msg.payload.accuracy,
+              speed: msg.payload.speed,
+              heading: msg.payload.heading,
+              timestamp: msg.payload.timestamp,
+            };
+            const predictorResult = predictor.update(identity.clientId, location);
+            if (predictorResult.anomalies?.length) {
+              for (const anomaly of predictorResult.anomalies) {
+                const rooms_ = rooms.getClientRooms(identity.clientId);
+                for (const roomId of rooms_) {
+                  rooms.broadcast(roomId, {
+                    type: anomaly.type === "gps_anomaly" ? "gps_anomaly" : "kinematic_anomaly",
+                    payload: { clientId: identity.clientId, ...anomaly },
+                  }, identity.clientId);
+                }
+              }
+            }
+            predictor.checkPreAlerts(identity.clientId);
             const roomIds = rooms.getClientRooms(identity.clientId);
             for (const roomId of roomIds) {
               rooms.broadcast(roomId, {
@@ -776,6 +803,7 @@ export function createServer({
 
         rooms.disconnect(identity.clientId);
         rateLimiter.remove(identity.clientId);
+        predictor.removeClient(identity.clientId);
         const trackedIp = ws._trackedIp;
         if (trackedIp) {
           const count = ipConnectionCount.get(trackedIp) ?? 1;
@@ -866,5 +894,5 @@ export function createServer({
     });
   };
 
-  return { wss, httpServer, rooms, sessionManager, ipConnectionCount, rateLimiter, markShuttingDown };
+  return { wss, httpServer, rooms, sessionManager, ipConnectionCount, rateLimiter, markShuttingDown, predictor };
 }
