@@ -1,30 +1,60 @@
 -- Migration: Time-Series Compaction for location_events
--- Issue #257: Implement time-series data compaction with automated downsampling,
--- retention policies, and continuous aggregates.
+-- Setup declarative partitioning and tiered downsampling tables.
 --
 -- This migration:
---   1. Migrates location_events to a partitioned table (by day on timestamp)
---   2. Creates 1-minute downsample, 1-hour aggregate, and 1-day aggregate tables
---   3. Creates helper functions for compaction and querying
+--   1. Renames the existing location_events table to location_events_old.
+--   2. Recreates location_events with PARTITION BY RANGE (timestamp).
+--   3. Creates tiered downsample tables (location_events_1m, location_events_1h, location_events_1d)
+--      all partitioned by RANGE (bucket).
+--   4. Dynamically creates daily partitions for all dates present in location_events_old,
+--      migrates the existing data into the partitioned location_events table,
+--      and drops location_events_old upon completion.
+--   5. Sets up partition management helpers, auto-partition trigger, and compaction status tracking.
 --
 -- Prerequisites:
---   - PostgreSQL 16+ (for declarative partitioning)
---   - Optional: TimescaleDB extension for continuous aggregates
+--   - PostgreSQL 16+ (declarative partitioning)
+--   - Optional: PostGIS extension for geometry types
 --
 -- Usage:
 --   psql -d spatial_tracking -f migration-compaction.sql
 
 -- ============================================================
--- 0. Optionally enable TimescaleDB (skip if not installed)
--- ============================================================
--- CREATE EXTENSION IF NOT EXISTS timescaledb;
-
--- ============================================================
--- 1. Migrate location_events to partitioned table
+-- 0. Optional Extensions
 -- ============================================================
 
--- Create new partitioned table
-CREATE TABLE IF NOT EXISTS location_events_new (
+DO $$
+BEGIN
+  -- Attempt to enable PostGIS if available; ignore error if not installed
+  BEGIN
+    CREATE EXTENSION IF NOT EXISTS postgis;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+END $$;
+
+-- ============================================================
+-- 1. Rename existing location_events table to location_events_old
+-- ============================================================
+
+DO $$
+BEGIN
+  -- Only rename if location_events exists as a standard unpartitioned base table
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_name = 'location_events' AND table_type = 'BASE TABLE'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM pg_class WHERE relname = 'location_events' AND relkind = 'p'
+  ) THEN
+    ALTER TABLE location_events RENAME TO location_events_old;
+    RAISE NOTICE 'Renamed existing unpartitioned location_events table to location_events_old';
+  END IF;
+END $$;
+
+-- ============================================================
+-- 2. Recreate location_events with PARTITION BY RANGE (timestamp)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS location_events (
   id          UUID            NOT NULL DEFAULT gen_random_uuid(),
   client_id   TEXT            NOT NULL,
   room_id     TEXT            NOT NULL,
@@ -37,39 +67,6 @@ CREATE TABLE IF NOT EXISTS location_events_new (
   created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 ) PARTITION BY RANGE (timestamp);
 
--- Migrate data if old table exists and is not yet partitioned
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.tables
-    WHERE table_name = 'location_events'
-    AND table_type = 'BASE TABLE'
-  ) AND NOT EXISTS (
-    SELECT 1 FROM pg_class
-    WHERE relname = 'location_events'
-    AND relkind = 'p'
-  ) THEN
-    -- Copy data to new partitioned table
-    INSERT INTO location_events_new
-    SELECT id, client_id, room_id, latitude, longitude, altitude, accuracy, speed, timestamp, created_at
-    FROM location_events;
-
-    -- Drop old table and rename new
-    DROP TABLE location_events;
-    ALTER TABLE location_events_new RENAME TO location_events;
-  ELSIF NOT EXISTS (
-    SELECT 1 FROM information_schema.tables
-    WHERE table_name = 'location_events'
-  ) THEN
-    -- No existing table, just rename the new one
-    ALTER TABLE location_events_new RENAME TO location_events;
-  ELSE
-    -- Already partitioned, drop the unused new table
-    DROP TABLE IF EXISTS location_events_new;
-  END IF;
-END $$;
-
--- Create indexes on the partitioned table
 CREATE INDEX IF NOT EXISTS location_events_room_id_timestamp_idx
   ON location_events (room_id, timestamp DESC);
 
@@ -77,9 +74,75 @@ CREATE INDEX IF NOT EXISTS location_events_lat_lon_idx
   ON location_events (latitude, longitude);
 
 -- ============================================================
--- 2. Create partition creation helper
+-- 3. Create Tiered Downsample Tables (Partitioned by RANGE)
 -- ============================================================
 
+-- 3a. location_events_1m: 1-minute downsampled data
+CREATE TABLE IF NOT EXISTS location_events_1m (
+  room_id     TEXT            NOT NULL,
+  bucket      TIMESTAMPTZ     NOT NULL,
+  lat         NUMERIC,
+  lon         NUMERIC,
+  altitude    DOUBLE PRECISION,
+  accuracy    DOUBLE PRECISION,
+  speed       DOUBLE PRECISION,
+  point_count INT             NOT NULL DEFAULT 0
+) PARTITION BY RANGE (bucket);
+
+CREATE INDEX IF NOT EXISTS location_events_1m_room_bucket_idx
+  ON location_events_1m (room_id, bucket DESC);
+
+-- 3b. location_events_1h: 1-hour aggregate data (PostGIS geometry or fallback text)
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'geometry') THEN
+    CREATE TABLE IF NOT EXISTS location_events_1h (
+      room_id         TEXT            NOT NULL,
+      bucket          TIMESTAMPTZ     NOT NULL,
+      lat             NUMERIC,
+      lon             NUMERIC,
+      point_count     INT             NOT NULL DEFAULT 0,
+      distance        DOUBLE PRECISION DEFAULT 0,
+      avg_speed       DOUBLE PRECISION,
+      max_speed       DOUBLE PRECISION,
+      min_speed       DOUBLE PRECISION,
+      route_geometry  geometry
+    ) PARTITION BY RANGE (bucket);
+  ELSE
+    CREATE TABLE IF NOT EXISTS location_events_1h (
+      room_id         TEXT            NOT NULL,
+      bucket          TIMESTAMPTZ     NOT NULL,
+      lat             NUMERIC,
+      lon             NUMERIC,
+      point_count     INT             NOT NULL DEFAULT 0,
+      distance        DOUBLE PRECISION DEFAULT 0,
+      avg_speed       DOUBLE PRECISION,
+      max_speed       DOUBLE PRECISION,
+      min_speed       DOUBLE PRECISION,
+      route_geometry  TEXT
+    ) PARTITION BY RANGE (bucket);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS location_events_1h_room_bucket_idx
+  ON location_events_1h (room_id, bucket DESC);
+
+-- 3c. location_events_1d: 1-day aggregate data
+CREATE TABLE IF NOT EXISTS location_events_1d (
+  room_id     TEXT            NOT NULL,
+  bucket      TIMESTAMPTZ     NOT NULL,
+  point_count INT             NOT NULL DEFAULT 0,
+  distance    DOUBLE PRECISION DEFAULT 0
+) PARTITION BY RANGE (bucket);
+
+CREATE INDEX IF NOT EXISTS location_events_1d_room_bucket_idx
+  ON location_events_1d (room_id, bucket DESC);
+
+-- ============================================================
+-- 4. Partition Helper Functions
+-- ============================================================
+
+-- Daily partition creator for location_events
 CREATE OR REPLACE FUNCTION create_daily_partition(partition_date DATE)
 RETURNS VOID AS $$
 DECLARE
@@ -91,7 +154,6 @@ BEGIN
   start_date := partition_date;
   end_date := partition_date + INTERVAL '1 day';
 
-  -- Only create if it does not exist
   IF NOT EXISTS (
     SELECT 1 FROM pg_class WHERE relname = partition_name
   ) THEN
@@ -103,144 +165,145 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ============================================================
--- 3. Auto-create partitions for the next 30 days
--- ============================================================
-
-DO $$
+-- Partition creator for 1m downsample table
+CREATE OR REPLACE FUNCTION create_1m_partition(partition_date DATE)
+RETURNS VOID AS $$
 DECLARE
-  i INT;
-  d DATE;
+  partition_name TEXT;
+  start_date DATE;
+  end_date DATE;
 BEGIN
-  FOR i IN 0..30 LOOP
-    d := CURRENT_DATE + (i || ' days')::INTERVAL;
-    PERFORM create_daily_partition(d);
-  END LOOP;
-END $$;
+  partition_name := 'location_events_1m_' || to_char(partition_date, 'YYYY_MM_DD');
+  start_date := partition_date;
+  end_date := partition_date + INTERVAL '1 day';
 
--- ============================================================
--- 4. Create 1-minute downsample table
--- ============================================================
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = partition_name) THEN
+    EXECUTE format(
+      'CREATE TABLE IF NOT EXISTS %I PARTITION OF location_events_1m FOR VALUES FROM (%L) TO (%L)',
+      partition_name, start_date, end_date
+    );
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TABLE IF NOT EXISTS location_events_1m (
-  id            UUID            NOT NULL DEFAULT gen_random_uuid(),
-  room_id       TEXT            NOT NULL,
-  bucket_start  TIMESTAMPTZ     NOT NULL,
-  bucket_end    TIMESTAMPTZ     NOT NULL,
-  latitude      DOUBLE PRECISION NOT NULL,
-  longitude     DOUBLE PRECISION NOT NULL,
-  altitude      DOUBLE PRECISION,
-  max_speed     DOUBLE PRECISION,
-  point_count   INTEGER         NOT NULL DEFAULT 0,
-  created_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-);
-
-CREATE INDEX IF NOT EXISTS idx_1m_room_bucket
-  ON location_events_1m (room_id, bucket_start DESC);
-
--- ============================================================
--- 5. Create 1-hour aggregate table
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS location_events_1h (
-  id              UUID            NOT NULL DEFAULT gen_random_uuid(),
-  room_id         TEXT            NOT NULL,
-  bucket_start    TIMESTAMPTZ     NOT NULL,
-  bucket_end      TIMESTAMPTZ     NOT NULL,
-  latitude        DOUBLE PRECISION NOT NULL,
-  longitude       DOUBLE PRECISION NOT NULL,
-  altitude        DOUBLE PRECISION,
-  avg_speed       DOUBLE PRECISION,
-  max_speed       DOUBLE PRECISION,
-  min_speed       DOUBLE PRECISION,
-  total_distance  DOUBLE PRECISION DEFAULT 0,
-  point_count     INTEGER         NOT NULL DEFAULT 0,
-  created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-);
-
-CREATE INDEX IF NOT EXISTS idx_1h_room_bucket
-  ON location_events_1h (room_id, bucket_start DESC);
-
--- ============================================================
--- 6. Create 1-day aggregate table
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS location_events_1d (
-  id              UUID            NOT NULL DEFAULT gen_random_uuid(),
-  room_id         TEXT            NOT NULL,
-  bucket_start    TIMESTAMPTZ     NOT NULL,
-  bucket_end      TIMESTAMPTZ     NOT NULL,
-  latitude        DOUBLE PRECISION NOT NULL,
-  longitude       DOUBLE PRECISION NOT NULL,
-  altitude        DOUBLE PRECISION,
-  avg_speed       DOUBLE PRECISION,
-  max_speed       DOUBLE PRECISION,
-  min_speed       DOUBLE PRECISION,
-  total_distance  DOUBLE PRECISION DEFAULT 0,
-  point_count     INTEGER         NOT NULL DEFAULT 0,
-  created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-);
-
-CREATE INDEX IF NOT EXISTS idx_1d_room_bucket
-  ON location_events_1d (room_id, bucket_start DESC);
-
--- ============================================================
--- 7. Create partition pruning helper for old raw data
--- ============================================================
-
-CREATE OR REPLACE FUNCTION drop_old_raw_partitions(retention_days INT)
-RETURNS TABLE(dropped_partition TEXT, dropped_rows BIGINT) AS $$
+-- Partition creator for 1h aggregate table
+CREATE OR REPLACE FUNCTION create_1h_partition(partition_date DATE)
+RETURNS VOID AS $$
 DECLARE
-  r RECORD;
-  cutoff_date DATE;
-  part_date DATE;
-  row_count BIGINT;
+  partition_name TEXT;
+  start_date DATE;
+  end_date DATE;
 BEGIN
-  cutoff_date := CURRENT_DATE - (retention_days || ' days')::INTERVAL;
+  partition_name := 'location_events_1h_' || to_char(partition_date, 'YYYY_MM');
+  start_date := date_trunc('month', partition_date)::DATE;
+  end_date := (date_trunc('month', partition_date) + INTERVAL '1 month')::DATE;
 
-  FOR r IN
-    SELECT inhrelid::regclass::text AS partition_name
-    FROM pg_inherits
-    JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-    JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-    WHERE parent.relname = 'location_events'
-    AND child.relname LIKE 'location_events_%\_%\_%\_%\_%\_%'
-  LOOP
-    -- Extract date from partition name
-    BEGIN
-      part_date := to_date(
-        replace(r.partition_name, 'location_events_', ''),
-        'YYYY_MM_DD'
-      );
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = partition_name) THEN
+    EXECUTE format(
+      'CREATE TABLE IF NOT EXISTS %I PARTITION OF location_events_1h FOR VALUES FROM (%L) TO (%L)',
+      partition_name, start_date, end_date
+    );
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
 
-      IF part_date < cutoff_date THEN
-        -- Count rows before dropping
-        EXECUTE format('SELECT count(*) FROM %I', r.partition_name) INTO row_count;
+-- Partition creator for 1d aggregate table
+CREATE OR REPLACE FUNCTION create_1d_partition(partition_date DATE)
+RETURNS VOID AS $$
+DECLARE
+  partition_name TEXT;
+  start_date DATE;
+  end_date DATE;
+BEGIN
+  partition_name := 'location_events_1d_' || to_char(partition_date, 'YYYY');
+  start_date := date_trunc('year', partition_date)::DATE;
+  end_date := (date_trunc('year', partition_date) + INTERVAL '1 year')::DATE;
 
-        -- Detach and drop the partition
-        EXECUTE format(
-          'ALTER TABLE location_events DETACH PARTITION %I',
-          r.partition_name
-        );
-        EXECUTE format('DROP TABLE %I', r.partition_name);
-
-        dropped_partition := r.partition_name;
-        dropped_rows := row_count;
-        RETURN NEXT;
-      END IF;
-    EXCEPTION WHEN OTHERS THEN
-      -- Skip partitions with non-standard naming
-      CONTINUE;
-    END;
-  END LOOP;
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = partition_name) THEN
+    EXECUTE format(
+      'CREATE TABLE IF NOT EXISTS %I PARTITION OF location_events_1d FOR VALUES FROM (%L) TO (%L)',
+      partition_name, start_date, end_date
+    );
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 8. Create partition auto-creation trigger
+-- 5. Data Migration from location_events_old & Partition Provisioning
+-- ============================================================
+
+DO $$
+DECLARE
+  day_record RECORD;
+  migrated_count BIGINT := 0;
+  i INT;
+BEGIN
+  -- If location_events_old exists, migrate its data
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_name = 'location_events_old'
+  ) THEN
+    -- Dynamically create daily partitions for each distinct day in location_events_old
+    FOR day_record IN
+      SELECT DISTINCT date_trunc('day', timestamp)::DATE AS part_date
+      FROM location_events_old
+      WHERE timestamp IS NOT NULL
+      ORDER BY part_date
+    LOOP
+      PERFORM create_daily_partition(day_record.part_date);
+    END LOOP;
+
+    -- Migrate all rows into the new partitioned location_events table
+    INSERT INTO location_events (
+      id,
+      client_id,
+      room_id,
+      latitude,
+      longitude,
+      altitude,
+      accuracy,
+      speed,
+      timestamp,
+      created_at
+    )
+    SELECT
+      id,
+      client_id,
+      room_id,
+      latitude,
+      longitude,
+      altitude,
+      accuracy,
+      speed,
+      timestamp,
+      created_at
+    FROM location_events_old;
+
+    GET DIAGNOSTICS migrated_count = ROW_COUNT;
+    RAISE NOTICE 'Successfully migrated % rows from location_events_old to location_events', migrated_count;
+
+    -- Drop location_events_old after successful data migration
+    DROP TABLE location_events_old;
+    RAISE NOTICE 'Dropped table location_events_old';
+  END IF;
+
+  -- Pre-provision partitions for today and the next 30 days for location_events
+  FOR i IN 0..30 LOOP
+    PERFORM create_daily_partition(CURRENT_DATE + (i || ' days')::INTERVAL);
+  END LOOP;
+
+  -- Pre-provision downsample partitions
+  FOR i IN 0..7 LOOP
+    PERFORM create_1m_partition(CURRENT_DATE + (i || ' days')::INTERVAL);
+  END LOOP;
+  PERFORM create_1h_partition(CURRENT_DATE);
+  PERFORM create_1h_partition((date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::DATE);
+  PERFORM create_1d_partition(CURRENT_DATE);
+  PERFORM create_1d_partition((date_trunc('year', CURRENT_DATE) + INTERVAL '1 year')::DATE);
+END $$;
+
+-- ============================================================
+-- 6. Trigger for Auto-Creating Future Partitions
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION auto_create_partition_trigger()
@@ -254,7 +317,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Drop existing trigger if it exists
 DROP TRIGGER IF EXISTS auto_partition_trigger ON location_events;
 
 CREATE TRIGGER auto_partition_trigger
@@ -263,7 +325,54 @@ CREATE TRIGGER auto_partition_trigger
   EXECUTE FUNCTION auto_create_partition_trigger();
 
 -- ============================================================
--- 9. Create compaction status tracking table
+-- 7. Partition Retention & Drop Helper
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION drop_old_raw_partitions(retention_days INT)
+RETURNS TABLE(dropped_partition TEXT, dropped_rows BIGINT) AS $$
+DECLARE
+  r RECORD;
+  cutoff_date DATE;
+  part_date DATE;
+  row_count BIGINT;
+BEGIN
+  cutoff_date := CURRENT_DATE - (retention_days || ' days')::INTERVAL;
+
+  FOR r IN
+    SELECT child.relname AS partition_name
+    FROM pg_inherits
+    JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+    JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+    WHERE parent.relname = 'location_events'
+    AND child.relkind = 'r'
+  LOOP
+    BEGIN
+      part_date := to_date(
+        replace(r.partition_name, 'location_events_', ''),
+        'YYYY_MM_DD'
+      );
+
+      IF part_date < cutoff_date THEN
+        EXECUTE format('SELECT count(*) FROM %I', r.partition_name) INTO row_count;
+        EXECUTE format(
+          'ALTER TABLE location_events DETACH PARTITION %I',
+          r.partition_name
+        );
+        EXECUTE format('DROP TABLE %I', r.partition_name);
+
+        dropped_partition := r.partition_name;
+        dropped_rows := row_count;
+        RETURN NEXT;
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      CONTINUE;
+    END;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- 8. Compaction Status Tracking Table
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS compaction_status (

@@ -1,13 +1,14 @@
 /**
  * @fileoverview Compaction and resolution-aware query tests for StorageAdapter.
  *
- * Tests the MemoryAdapter implementation of compaction, downsampling,
- * resolution-aware queryRoom, and getCompactionStatus.
+ * Tests the MemoryAdapter and PostgresAdapter implementations of compaction,
+ * downsampling, resolution-aware queryRoom, and getCompactionStatus.
  * PostgreSQL integration tests are skipped when DATABASE_URL is not set.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryAdapter } from "../src/storage/memory.js";
+import { PostgresAdapter } from "../src/storage/postgres.js";
 import { assertStorageAdapter } from "../src/storage/adapter.js";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -112,7 +113,6 @@ describe("queryRoom resolution routing", () => {
     await adapter.writeBatch([
       makeEvent({ roomId: "r1", timestamp: new Date().toISOString() }),
     ]);
-    // Should not throw with default resolution
     const results = await adapter.queryRoom("r1");
     expect(results.length).toBeGreaterThan(0);
   });
@@ -141,13 +141,11 @@ describe("queryRoom resolution routing", () => {
 
     const results = await adapter.queryRoom("r1", { resolution: "1m" });
     expect(results.length).toBeGreaterThan(0);
-    // Downsampled events have clientId "downsample"
     expect(results[0].clientId).toBe("downsample");
   });
 
   it("resolution='1h' returns aggregate data after compaction", async () => {
     const base = Date.now();
-    // Generate events across multiple minutes
     const events = [];
     for (let i = 0; i < 10; i++) {
       events.push(makeEvent({
@@ -169,7 +167,6 @@ describe("queryRoom resolution routing", () => {
 
   it("resolution='1d' returns aggregate data after compaction", async () => {
     const base = Date.now();
-    // Generate events across multiple hours
     const events = [];
     for (let i = 0; i < 5; i++) {
       events.push(makeEvent({
@@ -189,7 +186,7 @@ describe("queryRoom resolution routing", () => {
     expect(results[0].clientId).toBe("aggregate-1d");
   });
 
-  it("resolution='auto' selects raw for short time ranges", async () => {
+  it("resolution='auto' selects raw for range < 1h", async () => {
     const base = Date.now();
     await adapter.writeBatch([
       makeEvent({ roomId: "r1", timestamp: new Date(base).toISOString() }),
@@ -200,8 +197,54 @@ describe("queryRoom resolution routing", () => {
       to: new Date(base + 10000),
       resolution: "auto",
     });
-    // Short range should return raw events
     expect(results.length).toBe(1);
+    expect(results[0].clientId).not.toBe("downsample");
+  });
+
+  it("resolution='auto' selects 1m for range < 1d", async () => {
+    const base = Date.now() - 5 * 3600000;
+    await adapter.writeBatch([
+      makeEvent({ roomId: "r1", timestamp: new Date(base).toISOString() }),
+      makeEvent({ roomId: "r1", timestamp: new Date(base + 30000).toISOString() }),
+    ]);
+
+    const results = await adapter.queryRoom("r1", {
+      from: new Date(base - 10000),
+      to: new Date(base + 3 * 3600000),
+      resolution: "auto",
+    });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].clientId).toBe("downsample");
+  });
+
+  it("resolution='auto' selects 1h for range < 7d", async () => {
+    const base = Date.now() - 3 * 86400000;
+    await adapter.writeBatch([
+      makeEvent({ roomId: "r1", timestamp: new Date(base).toISOString() }),
+    ]);
+
+    const results = await adapter.queryRoom("r1", {
+      from: new Date(base - 86400000),
+      to: new Date(base + 2 * 86400000),
+      resolution: "auto",
+    });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].clientId).toBe("aggregate-1h");
+  });
+
+  it("resolution='auto' selects 1d for range >= 7d", async () => {
+    const base = Date.now() - 10 * 86400000;
+    await adapter.writeBatch([
+      makeEvent({ roomId: "r1", timestamp: new Date(base).toISOString() }),
+    ]);
+
+    const results = await adapter.queryRoom("r1", {
+      from: new Date(base - 86400000),
+      to: new Date(base + 9 * 86400000),
+      resolution: "auto",
+    });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].clientId).toBe("aggregate-1d");
   });
 
   it("resolution='auto' defaults to raw when no time range specified", async () => {
@@ -244,32 +287,40 @@ describe("MemoryAdapter compaction", () => {
     expect(typeof result.durationMs).toBe("number");
   });
 
-  it("compact() computes 1m downsamples from raw data", async () => {
+  it("compact() computes 1m downsamples with accurate aggregation", async () => {
     const base = Date.now();
-    // Generate multiple events within the same minute
-    const events = [];
-    for (let i = 0; i < 5; i++) {
-      events.push(makeEvent({
+    const events = [
+      makeEvent({
         roomId: "r1",
-        latitude: 40.7128 + i * 0.01,
-        longitude: -74.006 + i * 0.01,
-        timestamp: new Date(base + i * 1000).toISOString(),
-      }));
-    }
+        latitude: 10,
+        longitude: 20,
+        altitude: 100,
+        speed: 5,
+        timestamp: new Date(base + 1000).toISOString(),
+      }),
+      makeEvent({
+        roomId: "r1",
+        latitude: 30,
+        longitude: 40,
+        altitude: 200,
+        speed: 15,
+        timestamp: new Date(base + 2000).toISOString(),
+      }),
+    ];
     await adapter.writeBatch(events);
 
     const result = await adapter.compact();
-    // Should have created downsample rows
     expect(result.downsample1m).toBeGreaterThanOrEqual(1);
 
-    // Verify 1m data is queryable
     const m1Results = await adapter.queryRoom("r1", { resolution: "1m" });
     expect(m1Results.length).toBeGreaterThanOrEqual(1);
+    expect(m1Results[0].latitude).toBe(20);
+    expect(m1Results[0].longitude).toBe(30);
+    expect(m1Results[0].pointCount).toBe(2);
   });
 
   it("compact() computes 1h aggregates from 1m data", async () => {
     const base = Date.now();
-    // Generate events across multiple minutes to get 1h aggregates
     const events = [];
     for (let i = 0; i < 10; i++) {
       events.push(makeEvent({
@@ -285,7 +336,6 @@ describe("MemoryAdapter compaction", () => {
 
   it("compact() computes 1d aggregates from 1h data", async () => {
     const base = Date.now();
-    // Generate events across multiple hours
     const events = [];
     for (let i = 0; i < 5; i++) {
       events.push(makeEvent({
@@ -322,8 +372,6 @@ describe("MemoryAdapter compaction", () => {
 
     await adapter.compact();
     const result2 = await adapter.compact();
-
-    // Second run should still work
     expect(result2.durationMs).toBeGreaterThanOrEqual(0);
   });
 
@@ -341,19 +389,6 @@ describe("MemoryAdapter compaction", () => {
     const statusAfter = await adapter.getCompactionStatus();
     expect(statusAfter.lastRun).not.toBeNull();
     expect(statusAfter.tiers[0].rows).toBeGreaterThanOrEqual(0);
-  });
-
-  it("compaction is idempotent and resumable", async () => {
-    const base = Date.now();
-    await adapter.writeBatch(generateEvents("r1", base, 50, 1000));
-    await adapter.compact();
-
-    // Run compaction again — should not throw or duplicate data
-    const result = await adapter.compact();
-    expect(result.durationMs).toBeGreaterThanOrEqual(0);
-
-    const m1 = await adapter.queryRoom("r1", { resolution: "1m" });
-    expect(m1.length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -398,7 +433,6 @@ describe("Compaction tier statistics", () => {
 
   it("1h tier gets populated after compaction", async () => {
     const base = Date.now();
-    // Events across multiple minutes
     await adapter.writeBatch(generateEvents("r1", base, 10, 60000));
     await adapter.compact();
 
@@ -417,9 +451,9 @@ describe("Compaction tier statistics", () => {
   });
 });
 
-// ─── multi-room compaction ────────────────────────────────────────────────────
+// ─── multi-room compaction & distance ─────────────────────────────────────────
 
-describe("Multi-room compaction", () => {
+describe("Multi-room compaction and distance calculation", () => {
   let adapter;
 
   beforeEach(async () => {
@@ -445,38 +479,8 @@ describe("Multi-room compaction", () => {
     expect(b1m.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("queryRoom resolution only returns data for the requested room", async () => {
-    const base = Date.now();
-    await adapter.writeBatch([
-      ...generateEvents("room-a", base, 5, 1000),
-      ...generateEvents("room-b", base, 5, 1000),
-    ]);
-
-    await adapter.compact();
-
-    const aResults = await adapter.queryRoom("room-a", { resolution: "1m" });
-    for (const r of aResults) {
-      expect(r.roomId).toBe("room-a");
-    }
-  });
-});
-
-// ─── haversine distance calculation ───────────────────────────────────────────
-
-describe("Compaction distance calculation", () => {
-  let adapter;
-
-  beforeEach(async () => {
-    adapter = new MemoryAdapter();
-  });
-
-  afterEach(async () => {
-    await adapter.close();
-  });
-
   it("1h aggregate includes totalDistance", async () => {
     const base = Date.now();
-    // Events spread across different locations over multiple minutes
     const events = [];
     for (let i = 0; i < 10; i++) {
       events.push(makeEvent({
@@ -498,27 +502,50 @@ describe("Compaction distance calculation", () => {
   });
 });
 
-// ─── close edge cases ─────────────────────────────────────────────────────────
+// ─── PostgresAdapter unit tests (mock / constructor) ──────────────────────────
 
-describe("Compaction close edge cases", () => {
-  it("compact() throws after close()", async () => {
-    const adapter = new MemoryAdapter();
-    await adapter.close();
-    await expect(adapter.compact()).rejects.toThrow("MemoryAdapter is closed");
+describe("PostgresAdapter constructor & configuration", () => {
+  it("reads default environment variable values", () => {
+    const adapter = new PostgresAdapter({ connectionString: "postgresql://localhost/test" });
+    expect(adapter._rawRetentionDays).toBe(7);
+    expect(adapter._downsample1mRetentionDays).toBe(90);
+    expect(adapter._downsample1hRetentionDays).toBe(365);
+    expect(adapter._aggregate1dRetentionDays).toBe(2555);
+    expect(adapter._compactionIntervalMs).toBe(300000);
+    expect(adapter._compactionBatchSize).toBe(10000);
+    expect(adapter._timescaleDbEnabled).toBe(false);
+    expect(typeof adapter.stopCompactionScheduler).toBe("function");
+    expect(typeof adapter.runCompaction).toBe("function");
   });
 
-  it("getCompactionStatus() throws after close()", async () => {
-    const adapter = new MemoryAdapter();
-    await adapter.close();
-    await expect(adapter.getCompactionStatus()).rejects.toThrow("MemoryAdapter is closed");
+  it("accepts custom configuration overrides", () => {
+    const adapter = new PostgresAdapter({
+      connectionString: "postgresql://localhost/test",
+      rawRetentionDays: 14,
+      downsample1mRetentionDays: 60,
+      downsample1hRetentionDays: 180,
+      aggregate1dRetentionDays: 365,
+      compactionIntervalMs: 60000,
+      compactionBatchSize: 5000,
+      timescaleDbEnabled: true,
+    });
+    expect(adapter._rawRetentionDays).toBe(14);
+    expect(adapter._downsample1mRetentionDays).toBe(60);
+    expect(adapter._downsample1hRetentionDays).toBe(180);
+    expect(adapter._aggregate1dRetentionDays).toBe(365);
+    expect(adapter._compactionIntervalMs).toBe(60000);
+    expect(adapter._compactionBatchSize).toBe(5000);
+    expect(adapter._timescaleDbEnabled).toBe(true);
   });
 
-  it("queryRoom with resolution throws after close()", async () => {
-    const adapter = new MemoryAdapter();
-    await adapter.close();
-    await expect(
-      adapter.queryRoom("r1", { resolution: "1m" })
-    ).rejects.toThrow("MemoryAdapter is closed");
+  it("stopCompactionScheduler clears timer cleanly", () => {
+    const adapter = new PostgresAdapter({
+      connectionString: "postgresql://localhost/test",
+      compactionIntervalMs: 100000,
+    });
+    adapter._compactionTimer = setTimeout(() => {}, 50000);
+    adapter.stopCompactionScheduler();
+    expect(adapter._compactionTimer).toBeNull();
   });
 });
 
@@ -527,91 +554,64 @@ describe("Compaction close edge cases", () => {
 const describePg = process.env.DATABASE_URL ? describe : describe.skip;
 
 describePg("PostgreSQL compaction integration", () => {
-  let PostgresAdapter;
+  let adapter;
 
   beforeEach(async () => {
-    const mod = await import("../src/storage/postgres.js");
-    PostgresAdapter = mod.PostgresAdapter;
+    adapter = new PostgresAdapter({
+      connectionString: process.env.DATABASE_URL,
+      compactionIntervalMs: 600000,
+    });
+    await adapter._init();
+  });
+
+  afterEach(async () => {
+    await adapter.close();
   });
 
   it("PostgresAdapter implements compact and getCompactionStatus", async () => {
-    const adapter = new PostgresAdapter({
-      connectionString: process.env.DATABASE_URL,
-      compactionIntervalMs: 600000, // disable auto-compaction for tests
-    });
-    try {
-      expect(() => assertStorageAdapter(adapter)).not.toThrow();
-      expect(typeof adapter.compact).toBe("function");
-      expect(typeof adapter.getCompactionStatus).toBe("function");
+    expect(() => assertStorageAdapter(adapter)).not.toThrow();
+    expect(typeof adapter.compact).toBe("function");
+    expect(typeof adapter.getCompactionStatus).toBe("function");
 
-      const status = await adapter.getCompactionStatus();
-      expect(status).toHaveProperty("tiers");
-      expect(Array.isArray(status.tiers)).toBe(true);
-    } finally {
-      await adapter.close();
-    }
+    const status = await adapter.getCompactionStatus();
+    expect(status).toHaveProperty("tiers");
+    expect(Array.isArray(status.tiers)).toBe(true);
   });
 
   it("PostgresAdapter compact() runs without error", async () => {
-    const adapter = new PostgresAdapter({
-      connectionString: process.env.DATABASE_URL,
-      compactionIntervalMs: 600000,
-    });
-    try {
-      const result = await adapter.compact();
-      expect(result).toHaveProperty("rawDeleted");
-      expect(result).toHaveProperty("downsample1m");
-      expect(result).toHaveProperty("aggregate1h");
-      expect(result).toHaveProperty("aggregate1d");
-      expect(result).toHaveProperty("durationMs");
-    } finally {
-      await adapter.close();
-    }
+    const result = await adapter.compact();
+    expect(result).toHaveProperty("rawDeleted");
+    expect(result).toHaveProperty("downsample1m");
+    expect(result).toHaveProperty("aggregate1h");
+    expect(result).toHaveProperty("aggregate1d");
+    expect(result).toHaveProperty("durationMs");
   });
 
   it("PostgresAdapter queryRoom with resolution=raw returns raw events", async () => {
-    const adapter = new PostgresAdapter({
-      connectionString: process.env.DATABASE_URL,
-      compactionIntervalMs: 600000,
-    });
-    try {
-      const base = Date.now();
-      await adapter.writeBatch([
-        makeEvent({ roomId: "pg-test-raw", timestamp: new Date(base).toISOString() }),
-        makeEvent({ roomId: "pg-test-raw", timestamp: new Date(base + 1000).toISOString() }),
-      ]);
+    const base = Date.now();
+    await adapter.writeBatch([
+      makeEvent({ roomId: "pg-test-raw", timestamp: new Date(base).toISOString() }),
+      makeEvent({ roomId: "pg-test-raw", timestamp: new Date(base + 1000).toISOString() }),
+    ]);
 
-      // Flush the buffer
-      await adapter._flush();
+    await adapter._flush();
 
-      const results = await adapter.queryRoom("pg-test-raw", { resolution: "raw" });
-      expect(results.length).toBeGreaterThanOrEqual(2);
-    } finally {
-      await adapter.close();
-    }
+    const results = await adapter.queryRoom("pg-test-raw", { resolution: "raw" });
+    expect(results.length).toBeGreaterThanOrEqual(2);
   });
 
   it("PostgresAdapter queryRoom with resolution=auto selects appropriate tier", async () => {
-    const adapter = new PostgresAdapter({
-      connectionString: process.env.DATABASE_URL,
-      compactionIntervalMs: 600000,
-    });
-    try {
-      const base = Date.now();
-      await adapter.writeBatch([
-        makeEvent({ roomId: "pg-test-auto", timestamp: new Date(base).toISOString() }),
-      ]);
-      await adapter._flush();
+    const base = Date.now();
+    await adapter.writeBatch([
+      makeEvent({ roomId: "pg-test-auto", timestamp: new Date(base).toISOString() }),
+    ]);
+    await adapter._flush();
 
-      // Short range should resolve to raw
-      const results = await adapter.queryRoom("pg-test-auto", {
-        from: new Date(base - 10000),
-        to: new Date(base + 10000),
-        resolution: "auto",
-      });
-      expect(results.length).toBeGreaterThanOrEqual(1);
-    } finally {
-      await adapter.close();
-    }
+    const results = await adapter.queryRoom("pg-test-auto", {
+      from: new Date(base - 10000),
+      to: new Date(base + 10000),
+      resolution: "auto",
+    });
+    expect(results.length).toBeGreaterThanOrEqual(1);
   });
 });

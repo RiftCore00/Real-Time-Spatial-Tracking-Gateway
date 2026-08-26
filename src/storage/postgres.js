@@ -19,6 +19,7 @@
  */
 
 import { logger } from "../logger.js";
+import { StorageAdapter } from "./adapter.js";
 
 // ─────────────────────────── Schema DDL ────────────────────────────────────────
 
@@ -75,66 +76,65 @@ const CREATE_DOWNSAMPLE_1M_SQL = `
 CREATE TABLE IF NOT EXISTS location_events_1m (
   id            UUID            NOT NULL DEFAULT gen_random_uuid(),
   room_id       TEXT            NOT NULL,
-  bucket_start  TIMESTAMPTZ     NOT NULL,
-  bucket_end    TIMESTAMPTZ     NOT NULL,
-  latitude      DOUBLE PRECISION NOT NULL,
-  longitude     DOUBLE PRECISION NOT NULL,
+  bucket        TIMESTAMPTZ     NOT NULL,
+  lat           DOUBLE PRECISION NOT NULL,
+  lon           DOUBLE PRECISION NOT NULL,
   altitude      DOUBLE PRECISION,
-  max_speed     DOUBLE PRECISION,
+  accuracy      DOUBLE PRECISION,
+  speed         DOUBLE PRECISION,
   point_count   INTEGER         NOT NULL DEFAULT 0,
   created_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-)`;
+  PRIMARY KEY (room_id, bucket)
+);
+`;
 
 const CREATE_DOWNSAMPLE_1M_INDEX_SQL = `
 CREATE INDEX IF NOT EXISTS idx_1m_room_bucket
-  ON location_events_1m (room_id, bucket_start DESC)
+  ON location_events_1m (room_id, bucket DESC);
 `;
 
 const CREATE_AGGREGATE_1H_SQL = `
 CREATE TABLE IF NOT EXISTS location_events_1h (
   id              UUID            NOT NULL DEFAULT gen_random_uuid(),
   room_id         TEXT            NOT NULL,
-  bucket_start    TIMESTAMPTZ     NOT NULL,
-  bucket_end      TIMESTAMPTZ     NOT NULL,
-  latitude        DOUBLE PRECISION NOT NULL,
-  longitude       DOUBLE PRECISION NOT NULL,
+  bucket          TIMESTAMPTZ     NOT NULL,
+  lat             DOUBLE PRECISION NOT NULL,
+  lon             DOUBLE PRECISION NOT NULL,
   altitude        DOUBLE PRECISION,
+  accuracy        DOUBLE PRECISION,
   avg_speed       DOUBLE PRECISION,
   max_speed       DOUBLE PRECISION,
   min_speed       DOUBLE PRECISION,
-  total_distance  DOUBLE PRECISION DEFAULT 0,
+  distance        DOUBLE PRECISION DEFAULT 0,
   point_count     INTEGER         NOT NULL DEFAULT 0,
+  route_geometry  TEXT,
   created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-)`;
+  PRIMARY KEY (room_id, bucket)
+);
+`;
 
 const CREATE_AGGREGATE_1H_INDEX_SQL = `
 CREATE INDEX IF NOT EXISTS idx_1h_room_bucket
-  ON location_events_1h (room_id, bucket_start DESC)
+  ON location_events_1h (room_id, bucket DESC);
 `;
 
 const CREATE_AGGREGATE_1D_SQL = `
 CREATE TABLE IF NOT EXISTS location_events_1d (
   id              UUID            NOT NULL DEFAULT gen_random_uuid(),
   room_id         TEXT            NOT NULL,
-  bucket_start    TIMESTAMPTZ     NOT NULL,
-  bucket_end      TIMESTAMPTZ     NOT NULL,
-  latitude        DOUBLE PRECISION NOT NULL,
-  longitude       DOUBLE PRECISION NOT NULL,
-  altitude        DOUBLE PRECISION,
-  avg_speed       DOUBLE PRECISION,
-  max_speed       DOUBLE PRECISION,
-  min_speed       DOUBLE PRECISION,
-  total_distance  DOUBLE PRECISION DEFAULT 0,
+  bucket          TIMESTAMPTZ     NOT NULL,
+  lat             DOUBLE PRECISION,
+  lon             DOUBLE PRECISION,
   point_count     INTEGER         NOT NULL DEFAULT 0,
+  distance        DOUBLE PRECISION DEFAULT 0,
   created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (room_id, bucket_start)
-)`;
+  PRIMARY KEY (room_id, bucket)
+);
+`;
 
 const CREATE_AGGREGATE_1D_INDEX_SQL = `
 CREATE INDEX IF NOT EXISTS idx_1d_room_bucket
-  ON location_events_1d (room_id, bucket_start DESC)
+  ON location_events_1d (room_id, bucket DESC);
 `;
 
 // ─────────────────────────── Partition Helpers ──────────────────────────────────
@@ -199,99 +199,99 @@ CREATE TABLE IF NOT EXISTS compaction_status (
 
 /**
  * Compute 1-minute downsample rows from raw data for a given time range.
- * Uses median for lat/lon, max for speed.
+ * Uses percentile_disc for lat/lon, max for speed.
  */
 const DOWNSAMPLE_1M_SQL = `
 INSERT INTO location_events_1m
-  (room_id, bucket_start, bucket_end, latitude, longitude, altitude, max_speed, point_count)
+  (room_id, bucket, lat, lon, altitude, accuracy, speed, point_count)
 SELECT
   room_id,
-  date_trunc('minute', timestamp) AS bucket_start,
-  date_trunc('minute', timestamp) + INTERVAL '59 seconds 999 milliseconds' AS bucket_end,
-  percentile_cont(0.5) WITHIN GROUP (ORDER BY latitude) AS latitude,
-  percentile_cont(0.5) WITHIN GROUP (ORDER BY longitude) AS longitude,
+  date_trunc('minute', timestamp) AS bucket,
+  percentile_disc(0.5) WITHIN GROUP (ORDER BY latitude) AS lat,
+  percentile_disc(0.5) WITHIN GROUP (ORDER BY longitude) AS lon,
   AVG(altitude) AS altitude,
-  MAX(speed) AS max_speed,
+  AVG(accuracy) AS accuracy,
+  MAX(speed) AS speed,
   COUNT(*) AS point_count
 FROM location_events
-WHERE timestamp >= date_trunc('minute', $1::timestamptz)
-  AND timestamp <  date_trunc('minute', $2::timestamptz) + INTERVAL '1 minute'
+WHERE timestamp >= $1::timestamptz
+  AND timestamp <  $2::timestamptz
 GROUP BY room_id, date_trunc('minute', timestamp)
-ON CONFLICT (room_id, bucket_start) DO UPDATE SET
-  latitude = EXCLUDED.latitude,
-  longitude = EXCLUDED.longitude,
+ON CONFLICT (room_id, bucket) DO UPDATE SET
+  lat = EXCLUDED.lat,
+  lon = EXCLUDED.lon,
   altitude = EXCLUDED.altitude,
-  max_speed = EXCLUDED.max_speed,
-  point_count = EXCLUDED.point_count,
-  bucket_end = EXCLUDED.bucket_end;
+  accuracy = EXCLUDED.accuracy,
+  speed = EXCLUDED.speed,
+  point_count = EXCLUDED.point_count;
 `;
 
 /**
  * Compute 1-hour aggregates from 1-minute downsample data.
- * Includes haversine distance between consecutive median points.
+ * Includes haversine distance between consecutive points.
  */
 const AGGREGATE_1H_SQL = `
 WITH hourly AS (
   SELECT
     room_id,
-    date_trunc('hour', bucket_start) AS bucket_start,
-    AVG(latitude) AS latitude,
-    AVG(longitude) AS longitude,
+    date_trunc('hour', bucket) AS bucket,
+    AVG(lat) AS lat,
+    AVG(lon) AS lon,
     AVG(altitude) AS altitude,
-    AVG(max_speed) AS avg_speed,
-    MAX(max_speed) AS max_speed,
-    MIN(max_speed) AS min_speed,
+    AVG(accuracy) AS accuracy,
+    AVG(speed) AS avg_speed,
+    MAX(speed) AS max_speed,
+    MIN(speed) AS min_speed,
     SUM(point_count) AS point_count
   FROM location_events_1m
-  WHERE bucket_start >= date_trunc('hour', $1::timestamptz)
-    AND bucket_start <  date_trunc('hour', $2::timestamptz) + INTERVAL '1 hour'
-  GROUP BY room_id, date_trunc('hour', bucket_start)
+  WHERE bucket >= $1::timestamptz
+    AND bucket <  $2::timestamptz
+  GROUP BY room_id, date_trunc('hour', bucket)
 ),
 ordered AS (
   SELECT
     h.*,
-    LAG(latitude) OVER (PARTITION BY room_id ORDER BY bucket_start) AS prev_lat,
-    LAG(longitude) OVER (PARTITION BY room_id ORDER BY bucket_start) AS prev_lon
+    LAG(lat) OVER (PARTITION BY room_id ORDER BY bucket) AS prev_lat,
+    LAG(lon) OVER (PARTITION BY room_id ORDER BY bucket) AS prev_lon
   FROM hourly h
 )
 INSERT INTO location_events_1h
-  (room_id, bucket_start, bucket_end, latitude, longitude, altitude,
-   avg_speed, max_speed, min_speed, total_distance, point_count)
+  (room_id, bucket, lat, lon, altitude, accuracy, avg_speed, max_speed, min_speed, distance, point_count)
 SELECT
   room_id,
-  bucket_start,
-  bucket_start + INTERVAL '59 minutes 59 seconds 999 milliseconds' AS bucket_end,
-  latitude,
-  longitude,
+  bucket,
+  lat,
+  lon,
   altitude,
+  accuracy,
   avg_speed,
   max_speed,
   min_speed,
   COALESCE(
     (SELECT SUM(
       6371000.0 * 2 * asin(sqrt(
-        power(sin((o.latitude - o.prev_lat) / 2.0), 2) +
-        cos(radians(o.prev_lat)) * cos(radians(o.latitude)) *
-        power(sin((o.longitude - o.prev_lon) / 2.0), 2)
+        power(sin(radians(o.lat - o.prev_lat) / 2.0), 2) +
+        cos(radians(o.prev_lat)) * cos(radians(o.lat)) *
+        power(sin(radians(o.lon - o.prev_lon) / 2.0), 2)
       ))
     ) FROM ordered o
      WHERE o.room_id = ordered.room_id
-       AND o.bucket_start <= ordered.bucket_start
+       AND o.bucket <= ordered.bucket
        AND o.prev_lat IS NOT NULL
     ), 0
-  ) AS total_distance,
+  ) AS distance,
   point_count
 FROM ordered
-ON CONFLICT (room_id, bucket_start) DO UPDATE SET
-  latitude = EXCLUDED.latitude,
-  longitude = EXCLUDED.longitude,
+ON CONFLICT (room_id, bucket) DO UPDATE SET
+  lat = EXCLUDED.lat,
+  lon = EXCLUDED.lon,
   altitude = EXCLUDED.altitude,
+  accuracy = EXCLUDED.accuracy,
   avg_speed = EXCLUDED.avg_speed,
   max_speed = EXCLUDED.max_speed,
   min_speed = EXCLUDED.min_speed,
-  total_distance = EXCLUDED.total_distance,
-  point_count = EXCLUDED.point_count,
-  bucket_end = EXCLUDED.bucket_end;
+  distance = EXCLUDED.distance,
+  point_count = EXCLUDED.point_count;
 `;
 
 /**
@@ -299,34 +299,23 @@ ON CONFLICT (room_id, bucket_start) DO UPDATE SET
  */
 const AGGREGATE_1D_SQL = `
 INSERT INTO location_events_1d
-  (room_id, bucket_start, bucket_end, latitude, longitude, altitude,
-   avg_speed, max_speed, min_speed, total_distance, point_count)
+  (room_id, bucket, lat, lon, point_count, distance)
 SELECT
   room_id,
-  date_trunc('day', bucket_start) AS bucket_start,
-  date_trunc('day', bucket_start) + INTERVAL '23 hours 59 minutes 59 seconds 999 milliseconds' AS bucket_end,
-  AVG(latitude) AS latitude,
-  AVG(longitude) AS longitude,
-  AVG(altitude) AS altitude,
-  AVG(avg_speed) AS avg_speed,
-  MAX(max_speed) AS max_speed,
-  MIN(min_speed) AS min_speed,
-  SUM(total_distance) AS total_distance,
-  SUM(point_count) AS point_count
+  date_trunc('day', bucket) AS bucket,
+  AVG(lat) AS lat,
+  AVG(lon) AS lon,
+  SUM(point_count) AS point_count,
+  SUM(distance) AS distance
 FROM location_events_1h
-WHERE bucket_start >= date_trunc('day', $1::timestamptz)
-  AND bucket_start <  date_trunc('day', $2::timestamptz) + INTERVAL '1 day'
-GROUP BY room_id, date_trunc('day', bucket_start)
-ON CONFLICT (room_id, bucket_start) DO UPDATE SET
-  latitude = EXCLUDED.latitude,
-  longitude = EXCLUDED.longitude,
-  altitude = EXCLUDED.altitude,
-  avg_speed = EXCLUDED.avg_speed,
-  max_speed = EXCLUDED.max_speed,
-  min_speed = EXCLUDED.min_speed,
-  total_distance = EXCLUDED.total_distance,
+WHERE bucket >= $1::timestamptz
+  AND bucket <  $2::timestamptz
+GROUP BY room_id, date_trunc('day', bucket)
+ON CONFLICT (room_id, bucket) DO UPDATE SET
+  lat = EXCLUDED.lat,
+  lon = EXCLUDED.lon,
   point_count = EXCLUDED.point_count,
-  bucket_end = EXCLUDED.bucket_end;
+  distance = EXCLUDED.distance;
 `;
 
 const CREATE_DROP_PARTITION_FUNCTION_SQL = `
@@ -372,9 +361,9 @@ $func$ LANGUAGE plpgsql;
 
 // ─────────────────────────── Tier trim queries ─────────────────────────────────
 
-const TRIM_TIER_1M_SQL = `DELETE FROM location_events_1m WHERE bucket_start < $1::timestamptz;`;
-const TRIM_TIER_1H_SQL = `DELETE FROM location_events_1h WHERE bucket_start < $1::timestamptz;`;
-const TRIM_TIER_1D_SQL = `DELETE FROM location_events_1d WHERE bucket_start < $1::timestamptz;`;
+const TRIM_TIER_1M_SQL = `DELETE FROM location_events_1m WHERE bucket < $1::timestamptz;`;
+const TRIM_TIER_1H_SQL = `DELETE FROM location_events_1h WHERE bucket < $1::timestamptz;`;
+const TRIM_TIER_1D_SQL = `DELETE FROM location_events_1d WHERE bucket < $1::timestamptz;`;
 
 // ─────────────────────────── Status queries ────────────────────────────────────
 
@@ -404,9 +393,9 @@ SELECT
 // ─────────────────────────── Class ─────────────────────────────────────────────
 
 /**
- * @implements {import("./adapter.js").StorageAdapter}
+ * @extends {StorageAdapter}
  */
-export class PostgresAdapter {
+export class PostgresAdapter extends StorageAdapter {
   /**
    * @param {object} [config={}]
    * @param {string}  [config.connectionString]          - Postgres connection URL. Falls back to DATABASE_URL.
@@ -423,6 +412,8 @@ export class PostgresAdapter {
    * @param {boolean} [config.timescaleDbEnabled=false]      - Use TimescaleDB continuous aggregates.
    */
   constructor(config = {}) {
+    super();
+
     this._connectionString =
       config.connectionString ?? process.env.DATABASE_URL;
     this._poolSize = config.poolSize ?? 10;
@@ -431,15 +422,29 @@ export class PostgresAdapter {
     this._maxBufferSize = config.maxBufferSize ?? 10000;
 
     // Retention configuration
-    this._rawRetentionDays = config.rawRetentionDays ?? 7;
-    this._downsample1mRetentionDays = config.downsample1mRetentionDays ?? 90;
-    this._downsample1hRetentionDays = config.downsample1hRetentionDays ?? 365;
-    this._aggregate1dRetentionDays = config.aggregate1dRetentionDays ?? 2555;
+    this._rawRetentionDays =
+      config.rawRetentionDays ??
+      parseInt(process.env.STORAGE_RAW_RETENTION_DAYS ?? "7", 10);
+    this._downsample1mRetentionDays =
+      config.downsample1mRetentionDays ??
+      parseInt(process.env.STORAGE_1M_RETENTION_DAYS ?? "90", 10);
+    this._downsample1hRetentionDays =
+      config.downsample1hRetentionDays ??
+      parseInt(process.env.STORAGE_1H_RETENTION_DAYS ?? "365", 10);
+    this._aggregate1dRetentionDays =
+      config.aggregate1dRetentionDays ??
+      parseInt(process.env.STORAGE_1D_RETENTION_DAYS ?? "2555", 10);
 
     // Compaction configuration
-    this._compactionIntervalMs = config.compactionIntervalMs ?? 300000;
-    this._compactionBatchSize = config.compactionBatchSize ?? 10000;
-    this._timescaleDbEnabled = config.timescaleDbEnabled ?? false;
+    this._compactionIntervalMs =
+      config.compactionIntervalMs ??
+      parseInt(process.env.STORAGE_COMPACTION_INTERVAL_MS ?? "300000", 10);
+    this._compactionBatchSize =
+      config.compactionBatchSize ??
+      parseInt(process.env.STORAGE_COMPACTION_BATCH_SIZE ?? "10000", 10);
+    this._timescaleDbEnabled =
+      config.timescaleDbEnabled ??
+      (process.env.TIMESCALEDB_ENABLED === "true");
 
     /** @type {import("./adapter.js").LocationEvent[]} */
     this._buffer = [];
@@ -560,7 +565,7 @@ export class PostgresAdapter {
     }, this._flushIntervalMs);
     if (this._flushTimer.unref) this._flushTimer.unref();
 
-    // Start compaction timer
+    // Start compaction scheduler
     this._scheduleCompaction();
   }
 
@@ -620,8 +625,8 @@ export class PostgresAdapter {
   async _insertBatch(batch) {
     const clientIds = batch.map((e) => e.clientId);
     const roomIds = batch.map((e) => e.roomId);
-    const lats = batch.map((e) => e.latitude);
-    const lons = batch.map((e) => e.longitude);
+    const lats = batch.map((e) => e.latitude ?? e.lat);
+    const lons = batch.map((e) => e.longitude ?? e.lon);
     const alts = batch.map((e) => e.altitude ?? null);
     const accs = batch.map((e) => e.accuracy ?? null);
     const speeds = batch.map((e) => e.speed ?? null);
@@ -665,20 +670,43 @@ export class PostgresAdapter {
   }
 
   /**
+   * Stops the background compaction scheduler.
+   */
+  stopCompactionScheduler() {
+    if (this._compactionTimer) {
+      clearTimeout(this._compactionTimer);
+      this._compactionTimer = null;
+    }
+  }
+
+  /**
+   * Alias for compact().
+   */
+  async runCompaction(...args) {
+    return this.compact(...args);
+  }
+
+  /**
    * Run the full compaction pipeline:
    *   1. Drop expired raw partitions (instant DDL).
    *   2. Compute 1-minute downsamples for the last 24 hours.
    *   3. Compute 1-hour aggregates from new 1m data.
    *   4. Compute 1-day aggregates from new 1h data.
-   *   5. Trim each tier to its retention window.
+   *   5. Refresh TimescaleDB continuous aggregates (if enabled).
+   *   6. Trim each tier to its retention window.
    *
-   * Compaction is idempotent — re-running for the same time window
-   * performs upserts (ON CONFLICT DO UPDATE).
-   *
-   * @param {object} [overrides={}]
+   * @param {object|number} [rawRetentionDaysOrOptions]
+   * @param {number} [downsample1mRetentionDays]
+   * @param {number} [downsample1hRetentionDays]
+   * @param {number} [aggregate1dRetentionDays]
    * @returns {Promise<import("./adapter.js").CompactionResult>}
    */
-  async compact(overrides = {}) {
+  async compact(
+    rawRetentionDaysOrOptions = 7,
+    downsample1mRetentionDays = 90,
+    downsample1hRetentionDays = 365,
+    aggregate1dRetentionDays = 2555
+  ) {
     if (this._closed) throw new Error("PostgresAdapter is closed");
     if (this._compacting) {
       logger.info("Compaction already in progress, skipping");
@@ -694,32 +722,44 @@ export class PostgresAdapter {
     try {
       await this._init();
 
-      const rawRetention = overrides.rawRetentionDays ?? this._rawRetentionDays;
-      const m1Retention = overrides.downsample1mRetentionDays ?? this._downsample1mRetentionDays;
-      const h1Retention = overrides.downsample1hRetentionDays ?? this._downsample1hRetentionDays;
-      const d1Retention = overrides.aggregate1dRetentionDays ?? this._aggregate1dRetentionDays;
+      let rawRetention = this._rawRetentionDays;
+      let m1Retention = this._downsample1mRetentionDays;
+      let h1Retention = this._downsample1hRetentionDays;
+      let d1Retention = this._aggregate1dRetentionDays;
+
+      if (typeof rawRetentionDaysOrOptions === "object" && rawRetentionDaysOrOptions !== null) {
+        rawRetention = rawRetentionDaysOrOptions.rawRetentionDays ?? this._rawRetentionDays;
+        m1Retention = rawRetentionDaysOrOptions.downsample1mRetentionDays ?? this._downsample1mRetentionDays;
+        h1Retention = rawRetentionDaysOrOptions.downsample1hRetentionDays ?? this._downsample1hRetentionDays;
+        d1Retention = rawRetentionDaysOrOptions.aggregate1dRetentionDays ?? this._aggregate1dRetentionDays;
+      } else if (typeof rawRetentionDaysOrOptions === "number") {
+        rawRetention = rawRetentionDaysOrOptions;
+        if (typeof downsample1mRetentionDays === "number") m1Retention = downsample1mRetentionDays;
+        if (typeof downsample1hRetentionDays === "number") h1Retention = downsample1hRetentionDays;
+        if (typeof aggregate1dRetentionDays === "number") d1Retention = aggregate1dRetentionDays;
+      }
 
       let rawDeleted = 0;
 
       // Phase 1: Drop expired raw partitions (instant DDL)
       try {
         const dropResult = await this._pool.query(
-          `SELECT drop_old_raw_partitions($1)`,
+          `SELECT * FROM drop_old_raw_partitions($1)`,
           [rawRetention]
         );
         if (dropResult.rows.length > 0) {
-          rawDeleted = dropResult.rows.reduce((sum, r) => sum + Number(r.drop_old_raw_partitions || 0), 0);
+          rawDeleted = dropResult.rows.reduce((sum, r) => sum + Number(r.dropped_rows || 0), 0);
         }
         logger.info("Raw partition drop completed", { rawDeleted });
       } catch (err) {
         logger.warn("Raw partition drop failed", { error: err.message });
       }
 
-      // Phase 2: Compute 1-minute downsamples (last 24h window, safe for incremental)
+      // Phase 2: Compute 1-minute downsamples (last 24h window)
       let downsample1m = 0;
       try {
         const m1Start = new Date(Date.now() - 24 * 3600000);
-        const m1End = new Date();
+        const m1End = new Date(Date.now() + 60000);
         const m1Result = await this._pool.query(DOWNSAMPLE_1M_SQL, [m1Start, m1End]);
         downsample1m = m1Result.rowCount ?? 0;
         logger.info("1m downsample completed", { rows: downsample1m });
@@ -731,7 +771,7 @@ export class PostgresAdapter {
       let aggregate1h = 0;
       try {
         const h1Start = new Date(Date.now() - 7 * 86400000);
-        const h1End = new Date();
+        const h1End = new Date(Date.now() + 3600000);
         const h1Result = await this._pool.query(AGGREGATE_1H_SQL, [h1Start, h1End]);
         aggregate1h = h1Result.rowCount ?? 0;
         logger.info("1h aggregate completed", { rows: aggregate1h });
@@ -743,7 +783,7 @@ export class PostgresAdapter {
       let aggregate1d = 0;
       try {
         const d1Start = new Date(Date.now() - 90 * 86400000);
-        const d1End = new Date();
+        const d1End = new Date(Date.now() + 86400000);
         const d1Result = await this._pool.query(AGGREGATE_1D_SQL, [d1Start, d1End]);
         aggregate1d = d1Result.rowCount ?? 0;
         logger.info("1d aggregate completed", { rows: aggregate1d });
@@ -751,7 +791,21 @@ export class PostgresAdapter {
         logger.warn("1d aggregate failed", { error: err.message });
       }
 
-      // Phase 5: Trim each tier to retention window
+      // Phase 5: TimescaleDB Continuous Aggregates refresh if enabled
+      if (this._timescaleDbEnabled) {
+        try {
+          const caggResult = await this._pool.query(`
+            SELECT view_name FROM timescaledb_information.continuous_aggregates;
+          `);
+          for (const row of caggResult.rows) {
+            await this._pool.query(`CALL refresh_continuous_aggregate($1, NULL, NULL)`, [row.view_name]);
+          }
+        } catch (err) {
+          logger.debug("TimescaleDB continuous aggregate refresh skipped", { error: err.message });
+        }
+      }
+
+      // Phase 6: Trim each tier to retention window
       try {
         const m1Cutoff = new Date(Date.now() - m1Retention * 86400000);
         const h1Cutoff = new Date(Date.now() - h1Retention * 86400000);
@@ -811,20 +865,23 @@ export class PostgresAdapter {
     if (this._closed) throw new Error("PostgresAdapter is closed");
     await this._init();
 
-    let lastRun = null;
-    let nextRun = null;
+    let lastRun = this._lastCompactionRun;
+    let nextRun = this._nextCompactionRun ? new Date(this._nextCompactionRun).toISOString() : null;
 
     try {
       const statusResult = await this._pool.query(GET_COMPACT_STATUS_SQL);
       if (statusResult.rows.length > 0) {
-        lastRun = statusResult.rows[0].last_run;
-        nextRun = statusResult.rows[0].next_run;
+        if (statusResult.rows[0].last_run) {
+          lastRun = new Date(statusResult.rows[0].last_run).toISOString();
+        }
+        if (statusResult.rows[0].next_run) {
+          nextRun = new Date(statusResult.rows[0].next_run).toISOString();
+        }
       }
     } catch (err) {
       logger.warn("Failed to read compaction status", { error: err.message });
     }
 
-    // Get tier stats
     const tiers = [];
 
     // Raw tier
@@ -833,9 +890,9 @@ export class PostgresAdapter {
       if (rawStats.rows.length > 0) {
         const r = rawStats.rows[0];
         tiers.push({
-          name: r.tier_name,
-          rows: Number(r.row_count),
-          sizeBytes: Number(r.size_bytes),
+          name: "raw",
+          rows: Number(r.row_count || 0),
+          sizeBytes: Number(r.size_bytes || 0),
           oldest: r.oldest ? new Date(r.oldest).toISOString() : null,
           newest: r.newest ? new Date(r.newest).toISOString() : null,
         });
@@ -850,15 +907,15 @@ export class PostgresAdapter {
         `SELECT '1m' AS tier_name,
          COALESCE((SELECT count(*) FROM location_events_1m), 0) AS row_count,
          COALESCE(pg_total_relation_size('location_events_1m'), 0) AS size_bytes,
-         (SELECT MIN(bucket_start) FROM location_events_1m) AS oldest,
-         (SELECT MAX(bucket_start) FROM location_events_1m) AS newest;`
+         (SELECT MIN(bucket) FROM location_events_1m) AS oldest,
+         (SELECT MAX(bucket) FROM location_events_1m) AS newest;`
       );
       if (m1Stats.rows.length > 0) {
         const r = m1Stats.rows[0];
         tiers.push({
-          name: r.tier_name,
-          rows: Number(r.row_count),
-          sizeBytes: Number(r.size_bytes),
+          name: "1m",
+          rows: Number(r.row_count || 0),
+          sizeBytes: Number(r.size_bytes || 0),
           oldest: r.oldest ? new Date(r.oldest).toISOString() : null,
           newest: r.newest ? new Date(r.newest).toISOString() : null,
         });
@@ -873,15 +930,15 @@ export class PostgresAdapter {
         `SELECT '1h' AS tier_name,
          COALESCE((SELECT count(*) FROM location_events_1h), 0) AS row_count,
          COALESCE(pg_total_relation_size('location_events_1h'), 0) AS size_bytes,
-         (SELECT MIN(bucket_start) FROM location_events_1h) AS oldest,
-         (SELECT MAX(bucket_start) FROM location_events_1h) AS newest;`
+         (SELECT MIN(bucket) FROM location_events_1h) AS oldest,
+         (SELECT MAX(bucket) FROM location_events_1h) AS newest;`
       );
       if (h1Stats.rows.length > 0) {
         const r = h1Stats.rows[0];
         tiers.push({
-          name: r.tier_name,
-          rows: Number(r.row_count),
-          sizeBytes: Number(r.size_bytes),
+          name: "1h",
+          rows: Number(r.row_count || 0),
+          sizeBytes: Number(r.size_bytes || 0),
           oldest: r.oldest ? new Date(r.oldest).toISOString() : null,
           newest: r.newest ? new Date(r.newest).toISOString() : null,
         });
@@ -896,15 +953,15 @@ export class PostgresAdapter {
         `SELECT '1d' AS tier_name,
          COALESCE((SELECT count(*) FROM location_events_1d), 0) AS row_count,
          COALESCE(pg_total_relation_size('location_events_1d'), 0) AS size_bytes,
-         (SELECT MIN(bucket_start) FROM location_events_1d) AS oldest,
-         (SELECT MAX(bucket_start) FROM location_events_1d) AS newest;`
+         (SELECT MIN(bucket) FROM location_events_1d) AS oldest,
+         (SELECT MAX(bucket) FROM location_events_1d) AS newest;`
       );
       if (d1Stats.rows.length > 0) {
         const r = d1Stats.rows[0];
         tiers.push({
-          name: r.tier_name,
-          rows: Number(r.row_count),
-          sizeBytes: Number(r.size_bytes),
+          name: "1d",
+          rows: Number(r.row_count || 0),
+          sizeBytes: Number(r.size_bytes || 0),
           oldest: r.oldest ? new Date(r.oldest).toISOString() : null,
           newest: r.newest ? new Date(r.newest).toISOString() : null,
         });
@@ -914,8 +971,8 @@ export class PostgresAdapter {
     }
 
     return {
-      lastRun: lastRun ? new Date(lastRun).toISOString() : null,
-      nextRun: nextRun ? new Date(nextRun).toISOString() : null,
+      lastRun,
+      nextRun,
       tiers,
     };
   }
@@ -923,7 +980,7 @@ export class PostgresAdapter {
   // ─────────────────────────── read pipeline ────────────────────────────────
 
   /**
-   * Retrieves historical events for a room, ordered ascending by timestamp.
+   * Retrieves historical events for a room, ordered by timestamp.
    * Supports resolution parameter for tiered data access:
    *   "raw" - query raw location_events table
    *   "1m"  - query 1-minute downsampled data
@@ -939,74 +996,46 @@ export class PostgresAdapter {
     if (this._closed) throw new Error("PostgresAdapter is closed");
     await this._init();
 
-    const { from, to, limit, resolution = "auto" } = options;
+    const {
+      from = Date.now() - 86400000,
+      to = Date.now(),
+      limit = 1000,
+      resolution = "auto",
+    } = options;
+
+    const fromDate = from instanceof Date ? from : (typeof from === "string" ? new Date(from) : new Date(Number(from)));
+    const toDate = to instanceof Date ? to : (typeof to === "string" ? new Date(to) : new Date(Number(to)));
 
     let resolved = resolution;
     if (resolution === "auto") {
-      resolved = await this._autoResolveResolution(roomId, from, to, limit);
+      if (options.from === undefined && options.to === undefined) {
+        resolved = "raw";
+      } else {
+        const rangeMs = toDate.getTime() - fromDate.getTime();
+        if (rangeMs < 3600000) {
+          resolved = "raw";
+        } else if (rangeMs < 86400000) {
+          resolved = "1m";
+        } else if (rangeMs < 604800000) {
+          resolved = "1h";
+        } else {
+          resolved = "1d";
+        }
+      }
     }
 
     if (resolved === "1m") {
-      return this._queryRoom1m(roomId, from, to, limit);
+      return this._queryRoom1m(roomId, fromDate, toDate, limit);
     }
     if (resolved === "1h") {
-      return this._queryRoom1h(roomId, from, to, limit);
+      return this._queryRoom1h(roomId, fromDate, toDate, limit);
     }
     if (resolved === "1d") {
-      return this._queryRoom1d(roomId, from, to, limit);
+      return this._queryRoom1d(roomId, fromDate, toDate, limit);
     }
 
     // Default: raw
-    return this._queryRoomRaw(roomId, from, to, limit);
-  }
-
-  /**
-   * Auto-select the finest resolution that returns ≤ limit points.
-   * @private
-   */
-  async _autoResolveResolution(roomId, from, to, limit) {
-    const maxPoints = limit || 1000;
-    const now = new Date();
-    const fromMs = from ? from.getTime() : now.getTime() - 7 * 86400000;
-    const toMs = to ? to.getTime() : now.getTime();
-    const rangeMs = toMs - fromMs;
-
-    if (rangeMs <= 0) return "raw";
-
-    // Estimate raw points (1 per second)
-    const rawPointsEstimate = Math.floor(rangeMs / 1000);
-    if (rawPointsEstimate <= maxPoints) return "raw";
-
-    // Check 1m tier
-    const m1PointsEstimate = Math.floor(rangeMs / 60000);
-    if (m1PointsEstimate <= maxPoints) {
-      // Verify 1m data exists
-      try {
-        const result = await this._pool.query(
-          `SELECT count(*) FROM location_events_1m WHERE room_id = $1 AND bucket_start >= $2 AND bucket_start <= $3`,
-          [roomId, new Date(fromMs), new Date(toMs)]
-        );
-        if (Number(result.rows[0].count) <= maxPoints) return "1m";
-      } catch {
-        // 1m table may not have data, fall through
-      }
-    }
-
-    // Check 1h tier
-    const h1PointsEstimate = Math.floor(rangeMs / 3600000);
-    if (h1PointsEstimate <= maxPoints) {
-      try {
-        const result = await this._pool.query(
-          `SELECT count(*) FROM location_events_1h WHERE room_id = $1 AND bucket_start >= $2 AND bucket_start <= $3`,
-          [roomId, new Date(fromMs), new Date(toMs)]
-        );
-        if (Number(result.rows[0].count) <= maxPoints) return "1h";
-      } catch {
-        // 1h table may not have data
-      }
-    }
-
-    return "1d";
+    return this._queryRoomRaw(roomId, fromDate, toDate, limit);
   }
 
   /**
@@ -1029,7 +1058,8 @@ export class PostgresAdapter {
 
     let sql = `
       SELECT id, client_id AS "clientId", room_id AS "roomId",
-             latitude, longitude, altitude, accuracy, speed,
+             latitude, longitude, latitude AS lat, longitude AS lon,
+             altitude, accuracy, speed,
              timestamp::text AS timestamp,
              created_at::text AS "createdAt"
       FROM location_events
@@ -1056,28 +1086,32 @@ export class PostgresAdapter {
     let idx = 2;
 
     if (from instanceof Date) {
-      conditions.push(`bucket_start >= $${idx++}`);
+      conditions.push(`bucket >= $${idx++}`);
       params.push(from.toISOString());
     }
     if (to instanceof Date) {
-      conditions.push(`bucket_start <= $${idx++}`);
+      conditions.push(`bucket <= $${idx++}`);
       params.push(to.toISOString());
     }
 
     let sql = `
       SELECT
-        gen_random_uuid() AS id,
+        id,
         'downsample' AS "clientId",
         room_id AS "roomId",
-        latitude, longitude,
+        lat AS latitude, lon AS longitude,
+        lat, lon,
         altitude,
-        NULL AS accuracy,
-        max_speed AS speed,
-        bucket_start::text AS timestamp,
+        accuracy,
+        speed,
+        point_count AS "pointCount",
+        point_count AS "point_count",
+        bucket::text AS timestamp,
+        bucket::text AS bucket,
         created_at::text AS "createdAt"
       FROM location_events_1m
       WHERE ${conditions.join(" AND ")}
-      ORDER BY bucket_start ASC
+      ORDER BY bucket ASC
     `;
 
     if (typeof limit === "number" && limit > 0) {
@@ -1099,28 +1133,38 @@ export class PostgresAdapter {
     let idx = 2;
 
     if (from instanceof Date) {
-      conditions.push(`bucket_start >= $${idx++}`);
+      conditions.push(`bucket >= $${idx++}`);
       params.push(from.toISOString());
     }
     if (to instanceof Date) {
-      conditions.push(`bucket_start <= $${idx++}`);
+      conditions.push(`bucket <= $${idx++}`);
       params.push(to.toISOString());
     }
 
     let sql = `
       SELECT
-        gen_random_uuid() AS id,
+        id,
         'aggregate-1h' AS "clientId",
         room_id AS "roomId",
-        latitude, longitude,
+        lat AS latitude, lon AS longitude,
+        lat, lon,
         altitude,
-        NULL AS accuracy,
+        accuracy,
         avg_speed AS speed,
-        bucket_start::text AS timestamp,
+        avg_speed AS "avgSpeed",
+        max_speed AS "maxSpeed",
+        min_speed AS "minSpeed",
+        distance,
+        distance AS "totalDistance",
+        point_count AS "pointCount",
+        point_count AS "point_count",
+        route_geometry AS "routeGeometry",
+        bucket::text AS timestamp,
+        bucket::text AS bucket,
         created_at::text AS "createdAt"
       FROM location_events_1h
       WHERE ${conditions.join(" AND ")}
-      ORDER BY bucket_start ASC
+      ORDER BY bucket ASC
     `;
 
     if (typeof limit === "number" && limit > 0) {
@@ -1142,28 +1186,31 @@ export class PostgresAdapter {
     let idx = 2;
 
     if (from instanceof Date) {
-      conditions.push(`bucket_start >= $${idx++}`);
+      conditions.push(`bucket >= $${idx++}`);
       params.push(from.toISOString());
     }
     if (to instanceof Date) {
-      conditions.push(`bucket_start <= $${idx++}`);
+      conditions.push(`bucket <= $${idx++}`);
       params.push(to.toISOString());
     }
 
     let sql = `
       SELECT
-        gen_random_uuid() AS id,
+        id,
         'aggregate-1d' AS "clientId",
         room_id AS "roomId",
-        latitude, longitude,
-        altitude,
-        NULL AS accuracy,
-        avg_speed AS speed,
-        bucket_start::text AS timestamp,
+        lat AS latitude, lon AS longitude,
+        lat, lon,
+        point_count AS "pointCount",
+        point_count AS "point_count",
+        distance,
+        distance AS "totalDistance",
+        bucket::text AS timestamp,
+        bucket::text AS bucket,
         created_at::text AS "createdAt"
       FROM location_events_1d
       WHERE ${conditions.join(" AND ")}
-      ORDER BY bucket_start ASC
+      ORDER BY bucket ASC
     `;
 
     if (typeof limit === "number" && limit > 0) {
@@ -1250,19 +1297,22 @@ export class PostgresAdapter {
     if (this._closed) return;
     this._closed = true;
 
-    // Stop the periodic flush timer.
+    // Stop background compaction scheduler
+    this.stopCompactionScheduler();
+
+    // Stop the periodic flush timer
     if (this._flushTimer) {
       clearInterval(this._flushTimer);
       this._flushTimer = null;
     }
 
-    // Stop the compaction timer.
+    // Stop the compaction timer if still active
     if (this._compactionTimer) {
       clearTimeout(this._compactionTimer);
       this._compactionTimer = null;
     }
 
-    // Attempt a final flush of any remaining events.
+    // Attempt a final flush of any remaining events
     if (this._buffer.length > 0 && this._pool) {
       this._flushing = false;
       try {
@@ -1272,7 +1322,7 @@ export class PostgresAdapter {
       }
     }
 
-    // Drain the pool.
+    // Drain the pool
     if (this._pool) {
       try {
         await this._pool.end();

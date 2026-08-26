@@ -18,7 +18,7 @@ services:
       STORAGE_1D_RETENTION_DAYS: "2555"
       STORAGE_COMPACTION_INTERVAL_MS: "300000"
       STORAGE_COMPACTION_BATCH_SIZE: "10000"
-      TIMESCALEDB_ENABLED: "false"
+      TIMESCALEDB_ENABLED: "true"
     depends_on:
       - postgres
     restart: unless-stopped
