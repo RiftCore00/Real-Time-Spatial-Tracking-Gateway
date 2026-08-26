@@ -183,8 +183,30 @@ export function createServer({
 
   commands.subscribe((events) => {
     for (const event of events) {
-      if (baseEventType(event.eventType) === "location_update") {
+      const base = baseEventType(event.eventType);
+      if (base === "location_update") {
         deliverLocationUpdate(event.aggregateId, event.payload);
+      } else if (base === "geofence_entered") {
+        const ctx = sessions ? liveClients.get(event.aggregateId) : null;
+        if (ctx && event.payload?.roomId && event.payload?.fenceId) {
+          const fences = ctx.geofence.get(event.payload.roomId) ?? [];
+          if (!fences.includes(event.payload.fenceId)) {
+            ctx.geofence.set(event.payload.roomId, [...fences, event.payload.fenceId]);
+            touchSession(ctx);
+          }
+        }
+      } else if (base === "geofence_exited") {
+        const ctx = sessions ? liveClients.get(event.aggregateId) : null;
+        if (ctx && event.payload?.roomId && event.payload?.fenceId) {
+          const fences = ctx.geofence.get(event.payload.roomId) ?? [];
+          if (fences.includes(event.payload.fenceId)) {
+            ctx.geofence.set(
+              event.payload.roomId,
+              fences.filter((id) => id !== event.payload.fenceId)
+            );
+            touchSession(ctx);
+          }
+        }
       }
     }
   });
@@ -800,6 +822,7 @@ export function createServer({
         }
         case "ack": {
           metrics.messages.ack++;
+          if (ctx) ctx.ackedSeq.set(msg.roomId, msg.seq);
           rooms.ack(identity.clientId, msg.roomId, msg.seq);
           commands.dispatch(new AcknowledgeCommand({
             commandId: uuid(),
@@ -812,6 +835,7 @@ export function createServer({
               error: err.message,
             });
           });
+          touchSession(ctx);
           break;
         }
         case "nack": {
