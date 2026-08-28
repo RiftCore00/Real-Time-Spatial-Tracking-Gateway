@@ -332,6 +332,10 @@ function assertAppendable(events) {
       throw new TypeError(`Event ${e.eventId} has no finite sequence number`);
     }
   }
+  const aggregateIds = new Set(events.map((event) => event.aggregateId));
+  if (aggregateIds.size !== 1) {
+    throw new TypeError("append(events) requires events for one aggregate");
+  }
 }
 
 /**
@@ -603,11 +607,22 @@ export class PostgresEventStore {
   }
 
   async _doInit() {
-    const pg = await import("pg");
-    this._pool = new pg.Pool({
-      connectionString: this._connectionString,
+    const postgres = (await import("postgres")).default;
+    const sql = postgres(this._connectionString, {
       max: this._poolSize,
+      transform: { undefined: null },
     });
+    this._pool = {
+      query: async (text, values = []) => ({ rows: await sql.unsafe(text, values) }),
+      connect: async () => ({
+        query: async (queryText, queryValues = []) => ({ rows: await sql.unsafe(queryText, queryValues) }),
+        release: () => {},
+      }),
+      transaction: (fn) => sql.begin(async (tx) => fn({
+        query: async (queryText, queryValues = []) => ({ rows: await tx.unsafe(queryText, queryValues) }),
+      })),
+      end: () => sql.end(),
+    };
 
     const client = await this._pool.connect();
     try {
@@ -655,44 +670,34 @@ export class PostgresEventStore {
     assertAppendable(events);
     await this._init();
 
-    const client = await this._pool.connect();
-    try {
-      await client.query("BEGIN");
-      await this._ensurePartition(events[0].timestamp);
-
-      if (typeof opts.expectedSequence === "number") {
-        const cur = await client.query(
-          `SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE aggregate_id = $1`,
-          [events[0].aggregateId]
-        );
-        const actual = Number(cur.rows[0].seq);
-        if (actual !== opts.expectedSequence) {
-          await client.query("ROLLBACK");
-          throw new Error(
-            `Concurrency conflict on aggregate ${events[0].aggregateId}: expected ${opts.expectedSequence}, actual ${actual}`
+    await this._ensurePartition(events[0].timestamp);
+    await this._pool.transaction(async (client) => {
+        if (typeof opts.expectedSequence === "number") {
+          const cur = await client.query(
+            `SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE aggregate_id = $1`,
+            [events[0].aggregateId]
           );
+          const actual = Number(cur.rows[0].seq);
+          if (actual !== opts.expectedSequence) {
+            throw new Error(
+              `Concurrency conflict on aggregate ${events[0].aggregateId}: expected ${opts.expectedSequence}, actual ${actual}`
+            );
+          }
         }
-      }
 
-      await client.query(APPEND_BATCH_SQL, [
-        events.map((e) => e.eventId),
-        events.map((e) => e.eventType.slice(0, 100)),
-        events.map((e) => e.aggregateId),
-        events.map((e) => e.aggregateType ?? AggregateTypes.Vehicle),
-        events.map((e) => Math.trunc(e.sequence)),
-        events.map((e) => JSON.stringify(e.payload ?? {})),
-        events.map((e) => JSON.stringify(e.metadata ?? {})),
-        events.map((e) => e.timestamp),
-        events.map((e) => e.causationId ?? null),
-        events.map((e) => e.correlationId ?? null),
-      ]);
-      await client.query("COMMIT");
-    } catch (err) {
-      try { await client.query("ROLLBACK"); } catch { /* noop */ }
-      throw err;
-    } finally {
-      client.release();
-    }
+        await client.query(APPEND_BATCH_SQL, [
+          events.map((e) => e.eventId),
+          events.map((e) => e.eventType.slice(0, 100)),
+          events.map((e) => e.aggregateId),
+          events.map((e) => e.aggregateType ?? AggregateTypes.Vehicle),
+          events.map((e) => Math.trunc(e.sequence)),
+          events.map((e) => JSON.stringify(e.payload ?? {})),
+          events.map((e) => JSON.stringify(e.metadata ?? {})),
+          events.map((e) => e.timestamp),
+          events.map((e) => e.causationId ?? null),
+          events.map((e) => e.correlationId ?? null),
+        ]);
+    });
 
     this.event_store_append_duration_ms = performanceNow() - start;
     this.event_store_appends_total++;
@@ -1834,6 +1839,7 @@ export class ProjectionManager {
         if (projection.eventTypes && !projection.eventTypes.has(baseEventType(event.eventType))) continue;
         try {
           await projection.handle(event, this.sink);
+          await this.sink.markEventProcessed?.(projection.name, event.eventId);
           await this.sink.setCheckpoint(projection.name, event.eventId, event.timestamp);
         } catch (err) {
           this.log.error?.(`Projection "${projection.name}" failed`, {
@@ -1859,6 +1865,10 @@ export class ProjectionManager {
   async _isProcessedByAll(event) {
     if (this.projections.length === 0) return false;
     for (const projection of this.projections) {
+      if (typeof this.sink.isEventProcessed === "function") {
+        if (!(await this.sink.isEventProcessed(projection.name, event.eventId))) return false;
+        continue;
+      }
       const cp = await this.sink.getCheckpoint(projection.name);
       if (!cp || String(cp.lastEventId) < String(event.eventId)) return false;
     }
@@ -1890,6 +1900,7 @@ export class VehicleStateProjection {
     const base = baseEventType(event.eventType);
     if (base === "location_update") {
       const prev = (await sink.getVehicleState(event.aggregateId)) ?? {};
+      if (prev.locationUpdatedAt && Date.parse(prev.locationUpdatedAt) > Date.parse(event.timestamp)) return;
       await sink.upsertVehicleState(event.aggregateId, {
         ...prev,
         clientId: event.aggregateId,
@@ -1996,6 +2007,7 @@ export class MemoryProjectionSink {
     this.geofenceViolations = [];
     this.sequences = new Map();
     this.checkpoints = new Map();
+    this.processedEvents = new Map();
   }
 
   async upsertVehicleState(clientId, state) {
@@ -2064,6 +2076,19 @@ export class MemoryProjectionSink {
   async getCheckpoint(name) {
     return this.checkpoints.get(name) ?? null;
   }
+
+  async markEventProcessed(name, eventId) {
+    let ids = this.processedEvents.get(name);
+    if (!ids) {
+      ids = new Set();
+      this.processedEvents.set(name, ids);
+    }
+    ids.add(eventId);
+  }
+
+  async isEventProcessed(name, eventId) {
+    return this.processedEvents.get(name)?.has(eventId) ?? false;
+  }
 }
 
 /**
@@ -2086,11 +2111,19 @@ export class SqlProjectionSink {
   async _init() {
     if (this._initPromise) return this._initPromise;
     this._initPromise = (async () => {
-      const pg = await import("pg");
-      this._pool = new pg.Pool({
-        connectionString: this._connectionString,
+      const postgres = (await import("postgres")).default;
+      const sql = postgres(this._connectionString, {
         max: this._poolSize,
+        transform: { undefined: null },
       });
+      this._pool = {
+        query: async (text, values = []) => ({ rows: await sql.unsafe(text, values) }),
+        connect: async () => ({
+          query: async (queryText, queryValues = []) => ({ rows: await sql.unsafe(queryText, queryValues) }),
+          release: () => {},
+        }),
+        end: () => sql.end(),
+      };
       const client = await this._pool.connect();
       try {
         await client.query(`
@@ -2131,6 +2164,12 @@ export class SqlProjectionSink {
             sequence   BIGINT       NOT NULL DEFAULT 0,
             last_event_id UUID,
             updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS projection_events (
+            projection_name VARCHAR(100) NOT NULL,
+            event_id UUID NOT NULL,
+            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (projection_name, event_id)
           );
           CREATE TABLE IF NOT EXISTS projection_checkpoints (
             name          VARCHAR(100) PRIMARY KEY,
@@ -2330,6 +2369,24 @@ export class SqlProjectionSink {
       [name]
     );
     return r.rows.length > 0 ? { lastEventId: r.rows[0].last_event_id } : null;
+  }
+
+  async markEventProcessed(name, eventId) {
+    await this._init();
+    await this._pool.query(
+      `INSERT INTO projection_events (projection_name, event_id)
+       VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [name, eventId]
+    );
+  }
+
+  async isEventProcessed(name, eventId) {
+    await this._init();
+    const r = await this._pool.query(
+      `SELECT 1 FROM projection_events WHERE projection_name = $1 AND event_id = $2`,
+      [name, eventId]
+    );
+    return r.rows.length > 0;
   }
 
   async close() {
