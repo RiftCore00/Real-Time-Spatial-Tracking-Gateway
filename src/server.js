@@ -5,6 +5,7 @@ import { v4 as uuid } from "uuid";
 import jwt from "jsonwebtoken";
 import { RoomManager } from "./room-manager.js";
 import { SessionManager } from "./session-manager.js";
+import { PredictiveEngine } from "./predictor.js";
 import { validateMessage } from "./validator.js";
 import { verifyConnection } from "./auth.js";
 import { logger } from "./logger.js";
@@ -77,6 +78,10 @@ function sessionIdFromToken(token) {
  * Session resumption is opt-in: it activates when `sessionManager` is injected
  * or when an encryption key is available, and stays completely inert otherwise.
  *
+ * Predictive location modeling (issue #248): every accepted `location_update`
+ * feeds a per-client Kalman filter; geofence pre-alerts and anomaly events are
+ * broadcast to the client's rooms as new message types.
+ *
  * @param {object} [options]
  * @param {number} [options.port] - TCP port to listen on. Defaults to 8080.
  * @param {number} [options.heartbeatMs] - Ping interval used to detect zombies. Defaults to 30000.
@@ -84,10 +89,15 @@ function sessionIdFromToken(token) {
  * @param {number} [options.connRateLimit] - New connections allowed per IP per minute.
  * @param {number} [options.maxConnectionsPerIp] - Concurrent connections allowed per IP.
  * @param {number} [options.maxMessagesPerSecond] - Per-client message rate limit.
+ * @param {number} [options.maxRoomSize] - Max members per room.
+ * @param {number} [options.maxRoomsPerClient] - Rooms one client may join.
+ * @param {number} [options.maxMembersPerRoom] - Alias kept for API compatibility.
+ * @param {number} [options.maxRooms] - Total rooms.
  * @param {number} [options.ringBufferSize] - Replay entries kept per room.
  * @param {number} [options.deduplicationWindowMs] - TTL of a `location_update` dedup key.
  * @param {number} [options.maxBufferBytes] - Byte ceiling for one room's replay buffer.
  * @param {number} [options.maxDedupEntries] - Max dedup keys retained.
+ * @param {number} [options.ackWindowSize] - Replay window for `reconnect`.
  * @param {SessionManager} [options.sessionManager] - Pre-built manager; takes precedence over `sessionEncryptionKey`.
  * @param {string|object} [options.sessionEncryptionKey] - Key (or key map) used to build a manager.
  *   Falls back to `SESSION_ENCRYPTION_KEY`.
@@ -95,7 +105,7 @@ function sessionIdFromToken(token) {
  * @param {string} [options.instanceId] - Value published in the `GW_AFFINITY` cookie.
  *   Falls back to `INSTANCE_ID`, then a uuid.
  * @param {object} [options.redis] - node-redis v4 style client handed to a self-built manager.
- * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>> }}
+ * @returns {{ wss: WebSocketServer, server: http.Server, httpServer: http.Server, rooms: RoomManager, ipConnectionCount: Map<string, number>, rateLimiter: object, metrics: object, markShuttingDown: () => void, sessionManager: SessionManager|null, instanceId: string, saveAllSessions: () => Promise<Map<string, string>>, predictor: PredictiveEngine }}
  */
 export function createServer({
   port,
@@ -105,7 +115,7 @@ export function createServer({
   maxConnectionsPerIp,
   maxRoomSize,
   maxRoomsPerClient,
-  maxMembersPerRoom,
+  maxMembersPerRoom: _maxMembersPerRoom,
   maxRooms,
   ringBufferSize: _ringBufferSize,
   deduplicationWindowMs: _deduplicationWindowMs,
@@ -200,8 +210,9 @@ export function createServer({
       res.end(JSON.stringify({ error: "Bad Request" }));
       return;
     }
+    const { pathname } = url;
 
-    const migrate = req.method === "POST" ? MIGRATE_PATH.exec(url.pathname) : null;
+    const migrate = req.method === "POST" ? MIGRATE_PATH.exec(pathname) : null;
     if (migrate) {
       migrateClient(decodeURIComponent(migrate[1]))
         .then((blob) => {
@@ -227,13 +238,13 @@ export function createServer({
       return;
     }
 
-    if (url.pathname === "/health") {
+    if (pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "OK" }));
       return;
     }
 
-    if (url.pathname === "/healthz") {
+    if (pathname === "/healthz") {
       if (isShuttingDown) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "shutting down" }));
@@ -244,7 +255,7 @@ export function createServer({
       return;
     }
 
-    if (url.pathname === "/readyz") {
+    if (pathname === "/readyz") {
       if (isShuttingDown) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "not ready", reason: "server is shutting down" }));
@@ -336,7 +347,7 @@ export function createServer({
   const rooms = new RoomManager({
     maxRoomSize: effectiveMaxRoomSize,
     maxRoomsPerClient,
-    maxMembersPerRoom,
+    maxMembersPerRoom: _maxMembersPerRoom,
     maxRooms,
     ringBufferSize: _ringBufferSize,
     deduplicationWindowMs: _deduplicationWindowMs,
@@ -350,6 +361,29 @@ export function createServer({
   const MAX_CONNS_PER_IP = maxConnectionsPerIp ?? (Number(process.env.MAX_CONNECTIONS_PER_IP) || 10);
   const MAX_MESSAGES_PER_SECOND =
     maxMessagesPerSecond ?? (Number(process.env.MAX_MESSAGES_PER_SECOND) || 100);
+
+  // Issue #248: predictive engine (Kalman CV model per client). The geofence
+  // engine is not part of the gateway yet, so only trajectory/anomaly/ETA
+  // features are active here.
+  //
+  // Predictive events are delivered out-of-band: they must not consume room
+  // sequence numbers or enter the replay buffer, otherwise reconnecting
+  // clients would observe phantom sequence gaps in the telemetry stream.
+  function broadcastPredictiveEvent(roomId, message, excludeClientId) {
+    for (const client of wss.clients) {
+      const id = client._clientId;
+      if (!id || id === excludeClientId) continue;
+      if (!rooms.getClientRooms(id)?.has(roomId)) continue;
+      safeSend(client, message);
+    }
+  }
+  /** Room-manager facade handed to the predictor; routes events out-of-band. */
+  const predictorRooms = {
+    getClientRooms: (id) => rooms.getClientRooms(id),
+    broadcast: (roomId, message, excludeClientId) =>
+      broadcastPredictiveEvent(roomId, message, excludeClientId),
+  };
+  const predictor = new PredictiveEngine({ roomManager: predictorRooms });
 
   const HEARTBEAT_MS = heartbeatMs ?? 30000;
   // A client is a zombie once it stays silent for two ping intervals. The floor
@@ -646,6 +680,7 @@ export function createServer({
 
     const ip = req.socket.remoteAddress;
 
+    // Per-IP connection rate limit (new connections per minute)
     if (!connRateLimiter.check(ip)) {
       logger.warn("Connection rate limit exceeded", { ip });
       metrics.rateLimitRejections.connection++;
@@ -671,6 +706,63 @@ export function createServer({
       ws.close(4000, "Invalid request URL");
       return;
     }
+
+    /** Filled once authentication resolves; used by the close/error handlers. */
+    let identity = null;
+    /** Per-connection session context; null when resumption is disabled. */
+    let ctx = null;
+
+    /**
+     * Teardown shared by every exit path. Registered synchronously so it runs
+     * even when the socket dies during async auth or resumption.
+     */
+    ws.on("close", (code, reason) => {
+      const id = identity?.clientId ?? null;
+      if (ctx && id && sessions) {
+        // Snapshot before teardown so a later save cannot persist empty rooms.
+        ctx.frozenState = captureState(ctx);
+        rememberLocal(id, ctx.frozenState);
+        if (liveClients.get(id) === ctx) liveClients.delete(id);
+        sessions.flush(id).catch((err) => {
+          logger.error("Failed to flush session on close", { clientId: id, error: err.message });
+        });
+      }
+      if (id) {
+        rooms.disconnect(id);
+        rateLimiter.remove(id);
+        predictor.removeClient(id);
+      }
+      const trackedIp = ws._trackedIp;
+      if (trackedIp) {
+        const count = ipConnectionCount.get(trackedIp) ?? 1;
+        if (count <= 1) {
+          ipConnectionCount.delete(trackedIp);
+        } else {
+          ipConnectionCount.set(trackedIp, count - 1);
+        }
+        connRateLimiter.cleanup(trackedIp);
+      }
+      logger.info("Client disconnected", {
+        clientId: id ?? clientId,
+        code,
+        reason: reason?.toString() ?? "unknown",
+      });
+    });
+
+    ws.on("error", (err) => {
+      logger.error("WebSocket error", { clientId: identity?.clientId ?? clientId, error: err.message });
+    });
+
+    // Frames that arrive before auth/resumption completes are queued so no
+    // telemetry is lost; they are drained in order afterwards.
+    const preReadyQueue = [];
+    let dispatchMessage = null;
+    let ready = false;
+
+    ws.on("message", (raw) => {
+      if (ready && dispatchMessage) dispatchMessage(raw);
+      else preReadyQueue.push(raw);
+    });
 
     const token = url.searchParams.get("token");
     let authResult;
