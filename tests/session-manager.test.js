@@ -178,6 +178,14 @@ describe("SessionManager key material", () => {
     expect(() => new SessionManager({ encryptionKey: '{"v1": ' })).toThrow(/does not parse/);
   });
 
+  it("accepts a raw Buffer key", async () => {
+    const rawBufferKey = randomBytes(32);
+    const manager = newManager({ encryptionKey: rawBufferKey });
+    const blob = await manager.save("client-001", makeState());
+    expect(blob.startsWith("v1.")).toBe(true);
+    await expect(manager.load(blob)).resolves.toEqual(makeState());
+  });
+
   it("accepts a JSON string key map", async () => {
     const manager = newManager({ encryptionKey: JSON.stringify({ v1: KEY_A, v2: KEY_B }) });
     const blob = await manager.save("client-001", makeState());
@@ -499,6 +507,19 @@ describe("SessionManager debouncedSave", () => {
 
   it("rejects an invalid stateProvider", async () => {
     await expect(manager.debouncedSave("client-001", "nope")).rejects.toThrow(/stateProvider/);
+  });
+
+  it("saveDebounced works with direct state objects and custom ms", async () => {
+    const state = makeState({ protocolVersion: 7 });
+    await manager.saveDebounced("client-001", state, 200);
+
+    await vi.advanceTimersByTimeAsync(199);
+    expect(redis.set).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    const blob = redis.set.mock.calls[0][1];
+    await expect(manager.load(blob)).resolves.toEqual(state);
   });
 
   it("delete cancels a pending debounced save", async () => {

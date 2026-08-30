@@ -82,10 +82,14 @@ function unrefTimer(timer) {
  * @returns {Buffer} 32-byte derived key.
  */
 function deriveKey(keyId, value) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new TypeError(`encryptionKey["${keyId}"] must be a non-empty base64 string`);
+  let master;
+  if (Buffer.isBuffer(value)) {
+    master = value;
+  } else if (typeof value === "string" && value.trim().length > 0) {
+    master = Buffer.from(value, "base64");
+  } else {
+    throw new TypeError(`encryptionKey["${keyId}"] must be a non-empty base64 string or Buffer`);
   }
-  const master = Buffer.from(value, "base64");
   if (master.length !== KEY_BYTES) {
     throw new RangeError(
       `encryptionKey["${keyId}"] must decode to ${KEY_BYTES} bytes, got ${master.length}`
@@ -96,7 +100,7 @@ function deriveKey(keyId, value) {
 
 /**
  * Normalises the `encryptionKey` option into a `keyId → derived key` map.
- * Accepts a bare base64 key (bound to `keyId`), a JSON string, or an object.
+ * Accepts a bare base64 key or Buffer (bound to `keyId`), a JSON string, or an object.
  *
  * @param {unknown} encryptionKey
  * @param {string} keyId - Key used to seal new blobs; must exist in the result.
@@ -110,7 +114,9 @@ function parseKeyMap(encryptionKey, keyId) {
   }
 
   let source = encryptionKey;
-  if (typeof source === "string") {
+  if (Buffer.isBuffer(source)) {
+    source = { [keyId]: source };
+  } else if (typeof source === "string") {
     const trimmed = source.trim();
     if (trimmed.length === 0) throw new TypeError("encryptionKey must not be empty");
     if (trimmed.startsWith("{")) {
@@ -149,7 +155,7 @@ function parseKeyMap(encryptionKey, keyId) {
  */
 class MemoryStore {
   constructor() {
-    /** @type {Map<string, { value: string, expiresAt: number }>} */
+    /** @type {Map<string, { value: string, expiresAt: number, timer?: NodeJS.Timeout }>} */
     this._entries = new Map();
   }
 
@@ -159,7 +165,16 @@ class MemoryStore {
    * @param {{ PX: number }} opts - Millisecond TTL, matching node-redis.
    */
   async set(key, value, { PX }) {
-    this._entries.set(key, { value, expiresAt: Date.now() + PX });
+    const existing = this._entries.get(key);
+    if (existing?.timer) clearTimeout(existing.timer);
+
+    const timer = unrefTimer(
+      setTimeout(() => {
+        this._entries.delete(key);
+      }, PX)
+    );
+
+    this._entries.set(key, { value, expiresAt: Date.now() + PX, timer });
   }
 
   /**
@@ -170,6 +185,7 @@ class MemoryStore {
     const entry = this._entries.get(key);
     if (!entry) return null;
     if (entry.expiresAt <= Date.now()) {
+      if (entry.timer) clearTimeout(entry.timer);
       this._entries.delete(key);
       return null;
     }
@@ -178,6 +194,8 @@ class MemoryStore {
 
   /** @param {string} key */
   async del(key) {
+    const entry = this._entries.get(key);
+    if (entry?.timer) clearTimeout(entry.timer);
     this._entries.delete(key);
   }
 
@@ -185,8 +203,19 @@ class MemoryStore {
   sweep() {
     const now = Date.now();
     for (const [key, entry] of this._entries) {
-      if (entry.expiresAt <= now) this._entries.delete(key);
+      if (entry.expiresAt <= now) {
+        if (entry.timer) clearTimeout(entry.timer);
+        this._entries.delete(key);
+      }
     }
+  }
+
+  /** Clears all entries and their timers. */
+  clear() {
+    for (const entry of this._entries.values()) {
+      if (entry.timer) clearTimeout(entry.timer);
+    }
+    this._entries.clear();
   }
 
   /** @type {number} */
@@ -395,20 +424,43 @@ export class SessionManager {
   }
 
   /**
-   * Coalesces rapid state changes into one save per `debounceMs` per client.
+   * Coalesces rapid updates using an internal Map to ensure saves execute
+   * at most once every `ms` (default 500ms) per client.
+   *
+   * @param {string} clientId
+   * @param {SessionState|(() => SessionState)} stateOrProvider
+   * @param {number} [ms]
+   * @returns {Promise<void>}
+   */
+  async saveDebounced(clientId, stateOrProvider, ms = this._debounceMs) {
+    return this.debouncedSave(clientId, stateOrProvider, ms);
+  }
+
+  /**
+   * Coalesces rapid state changes into one save per `ms` per client.
    * `stateProvider` runs when the timer fires, so the newest state is captured.
    *
    * @param {string} clientId
-   * @param {() => SessionState} stateProvider
+   * @param {SessionState|(() => SessionState)} stateOrProvider
+   * @param {number} [ms]
    * @returns {Promise<void>} Resolves once the save is scheduled, not stored.
    */
-  async debouncedSave(clientId, stateProvider) {
+  async debouncedSave(clientId, stateOrProvider, ms = this._debounceMs) {
     if (typeof clientId !== "string" || clientId.length === 0) {
       throw new TypeError("clientId must be a non-empty string");
     }
-    if (typeof stateProvider !== "function") {
-      throw new TypeError("stateProvider must be a function returning the latest state");
+    if (
+      typeof stateOrProvider !== "function" &&
+      (stateOrProvider == null || typeof stateOrProvider !== "object")
+    ) {
+      throw new TypeError(
+        "stateProvider must be a function returning the latest state or a state object"
+      );
     }
+
+    const stateProvider =
+      typeof stateOrProvider === "function" ? stateOrProvider : () => stateOrProvider;
+    const delay = Number.isFinite(ms) && ms >= 0 ? ms : this._debounceMs;
 
     this._cancelDebounce(clientId);
     this._debounceProviders.set(clientId, stateProvider);
@@ -420,7 +472,7 @@ export class SessionManager {
           const provider = this._debounceProviders.get(clientId);
           this._debounceProviders.delete(clientId);
           if (provider) this._runSave(clientId, provider);
-        }, this._debounceMs)
+        }, delay)
       )
     );
   }
@@ -514,6 +566,9 @@ export class SessionManager {
       clearInterval(this._sweepTimer);
       this._sweepTimer = null;
     }
+    if (this._memory) {
+      this._memory.clear();
+    }
   }
 
   /**
@@ -543,3 +598,5 @@ export class SessionManager {
     };
   }
 }
+
+export default SessionManager;
